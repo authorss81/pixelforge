@@ -60,6 +60,45 @@ jobs:
 
       - run: flutter pub get
 
+      - name: Provide signing key
+        env:
+          RELEASE_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -n "${RELEASE_KEYSTORE_B64:-}" ]; then
+            echo "using the release keystore from secrets"
+            echo "$RELEASE_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            STORE="$RUNNER_TEMP/release.keystore"
+            STOREPASS='${{ secrets.KEYSTORE_PASSWORD }}'
+            KEYALIAS='${{ secrets.KEY_ALIAS }}'
+            KEYPASS='${{ secrets.KEY_PASSWORD }}'
+          else
+            echo "no release keystore secret; generating a throwaway CI key"
+            echo "this proves the pipeline, not the product; never publish it"
+            keytool -genkeypair -v -keystore "$RUNNER_TEMP/ci.keystore" \
+              -alias ci -keyalg RSA -keysize 2048 -validity 2 \
+              -storepass android -keypass android \
+              -dname "CN=PixelForge CI, OU=CI, O=PixelForge, L=CI, S=CI, C=US" \
+              -noprompt
+            STORE="$RUNNER_TEMP/ci.keystore"
+            STOREPASS='android'
+            KEYALIAS='ci'
+            KEYPASS='android'
+          fi
+          cat > android/key.properties <<EOF
+          storeFile=$STORE
+          storePassword=$STOREPASS
+          keyAlias=$KEYALIAS
+          keyPassword=$KEYPASS
+          EOF
+          echo "key.properties written (values masked in logs)"
+
+      - name: Verify release signing config
+        run: |
+          set -euo pipefail
+          cd android
+          ./gradlew :app:verifyReleaseSigning --offline || ./gradlew :app:verifyReleaseSigning
+
       - name: Build universal release APK
         run: flutter build apk --release
 

@@ -1,0 +1,14 @@
+# Copy this to android/key.properties and fill in the real values.
+# Never commit the real file. It is gitignored, and committing it would hand
+# anyone who can read the repo the ability to sign updates as you.
+#
+# Generate a keystore once with:
+#   keytool -genkeypair -v -keystore ~/pixelforge-release.jks \
+#     -alias pixelforge -keyalg RSA -keysize 2048 -validity 10000
+#
+# storeFile may be absolute (recommended) or relative to android/app/.
+
+storeFile=/absolute/path/to/pixelforge-release.jks
+storePassword=REPLACE_ME
+keyAlias=pixelforge
+keyPassword=REPLACE_ME
