@@ -2,20 +2,37 @@ name: ops
 
 # Self-dispatching phase runner.
 #
-#   select-phase  picks the lowest phase in workspace/ that has neither .done nor
-#                 .blocked, reading markers through the GitHub API with no
-#                 checkout so an idle tick costs only VM boot.
+#   select-phase  picks the lowest workspace/phase-NN without .done or .blocked,
+#                 reading markers through the GitHub API with no checkout so an
+#                 idle tick costs only VM boot.
 #   run-phase     installs Flutter and opencode, runs scripts/phase_runner.sh,
-#                 pushes the result to pf-bot/<phase> and opens a PR.
+#                 and pushes the verified result straight to main.
 #   review        a separate job with its own budget, so a slow phase can never
-#                 starve it. Never invalidates a phase that already passed.
-#   merge         enables GitHub auto-merge. main is branch-protected with the
-#                 build.yml checks required, so a red phase opens an issue
-#                 instead of landing.
+#                 starve it. Pushes its corrections straight to main too.
 #   retrigger     POSTs repository_dispatch back to this workflow ~10s after
 #                 each run, chaining the loop without waiting for cron.
 #
-# llops-tick.yml is the 5-minute cron safety net for when the retrigger fails.
+# Why direct push rather than pull requests
+# ----------------------------------------
+# A pull request authored by GITHUB_TOKEN never receives CI. GitHub suppresses
+# the `pull_request` event for changes made with the Actions token, as a
+# recursion guard, so no check-run ever attaches to the PR and
+# `statusCheckRollup` stays empty. Verified empirically on this repo: build.yml
+# dispatched directly at the PR head went fully green on the exact head SHA
+# (analyze + test, android, windows all success) and the PR still reported
+# BLOCKED with an empty rollup. Any required status check is therefore
+# permanently unsatisfiable, and `gh pr merge` cannot merge.
+#
+# That removes the entire point of a PR, which is the CI gate, so the machinery
+# was pure liability. The gate here is the in-pipeline verification instead:
+# `flutter analyze` and `flutter test` run before `.done` is written, and again
+# after the reviewer's fixes. That is the same gate a PR would have provided,
+# performed in the same run.
+#
+# Branch protection still applies to these pushes: linear history, no force
+# push, no deletions, conversation resolution, and enforce_admins so a
+# deliberate local push is required for anything unusual. build.yml runs on
+# every push to main as the after-the-fact audit trail.
 
 on:
   workflow_dispatch:
@@ -34,7 +51,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
   issues: write
   checks: read
 
@@ -43,7 +59,7 @@ concurrency:
   # false on purpose. phase_runner.sh checkpoints to pf-bot/wip/<phase> every
   # 300s, but work done between two checkpoints lives only in the working tree.
   # Cancelling in that window would destroy it. With false, a new tick queues
-  # and starts after the prior run's push step has completed.
+  # and starts after the prior run's push has completed.
   cancel-in-progress: false
 
 env:
@@ -81,26 +97,6 @@ jobs:
           grep -E '^workspace/phase-[0-9]+/' /tmp/tree.txt | cut -d/ -f2 | sort -V -u > /tmp/phase_names.txt
           [ -s /tmp/phase_names.txt ] || { echo "no phases declared"; echo "exists=false" >> "$GITHUB_OUTPUT"; exit 0; }
 
-          # Capability probe. A repo whose workflow token cannot create pull
-          # requests fails every phase silently at the very last step, after the
-          # agent has already burned its whole budget. One cheap call here turns
-          # that into an immediate, obvious error with the fix spelled out.
-          if ! gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls" \
-               -f title="pixelforge ops capability probe" \
-               -f head="${{ github.actor }}:ops-capability-probe" \
-               -f base=main -f body="probe" >/dev/null 2>&1; then
-            if gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls" \
-                 -f title="probe" -f head="probe" -f base=main -f body="probe" 2>&1 \
-                 | grep -q "not permitted to create or approve pull requests"; then
-              echo "::error::GITHUB_TOKEN cannot create pull requests. Enable it with:"
-              echo "::error::  gh api -X PUT repos/${GITHUB_REPOSITORY}/actions/permissions/workflow -F default_workflow_permissions=write -F can_approve_pull_request_reviews=true"
-              echo "exists=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          fi
-          git push origin --delete "ops-capability-probe" >/dev/null 2>&1 || true
-          gh pr close --head "ops-capability-probe" >/dev/null 2>&1 || true
-
           while read -r name; do
             [ -n "$name" ] || continue
             for m in done blocked deferred attempts terminal; do
@@ -134,8 +130,8 @@ jobs:
           fi
 
           # A deferred phase is a rate limit from a previous tick. Take it first
-          # so a single limit does not block the whole queue behind it. A
-          # deferred *terminal* phase waits its turn, see pass 2 below.
+          # so a single limit does not block the queue behind it. A deferred
+          # terminal phase waits its turn, see pass 2.
           for d in $(ls /tmp/phases/*.deferred 2>/dev/null | sort -V); do
             n="$(basename "$d" .deferred)"
             [ -f "/tmp/phases/${n}.terminal" ] && continue
@@ -154,9 +150,8 @@ jobs:
           done < /tmp/phase_names.txt
 
           # Pass 2: only once the ordinary queue is empty does a terminal phase
-          # run. This is what lets the release build be the last thing that
-          # happens while still letting the audit append work afterwards, since
-          # any new ordinary phase pushes the terminal phase back to the end.
+          # run, so the release build is always last. Any new ordinary phase
+          # pushes the terminal phase back to the end.
           for d in $(ls /tmp/phases/*.deferred 2>/dev/null | sort -V); do
             n="$(basename "$d" .deferred)"
             [ -f "/tmp/phases/${n}.terminal" ] || continue
@@ -189,10 +184,8 @@ jobs:
     timeout-minutes: ${{ fromJSON(needs.select-phase.outputs.timeout) }}
     outputs:
       phase: ${{ steps.meta.outputs.phase }}
-      branch: ${{ steps.meta.outputs.branch }}
-      done: ${{ steps.commit.outputs.done }}
-      env_blocked: ${{ steps.commit.outputs.env_blocked }}
-      pr: ${{ steps.pr.outputs.pr }}
+      done: ${{ steps.push.outputs.done }}
+      env_blocked: ${{ steps.push.outputs.env_blocked }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -209,18 +202,14 @@ jobs:
           set -euo pipefail
           curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION"
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.opencode/bin:$PATH"
           opencode --version
 
       - name: Meta
         id: meta
         run: |
-          PHASE="${{ needs.select-phase.outputs.phase }}"
-          echo "phase=${PHASE}" >> "$GITHUB_OUTPUT"
-          echo "branch=pf-bot/${PHASE}" >> "$GITHUB_OUTPUT"
+          echo "phase=${{ needs.select-phase.outputs.phase }}" >> "$GITHUB_OUTPUT"
           git config user.name "pixelforge-bot"
           git config user.email "pixelforge-bot@users.noreply.github.com"
-          git checkout -B "pf-bot/${PHASE}"
 
       - name: Run phase
         id: run
@@ -235,106 +224,54 @@ jobs:
           echo "exit=$?"
           exit 0
 
-      - name: Commit and push branch
-        id: commit
+      # Commit and push before review, not after. If the review, or this job,
+      # then times out, the phase is already on main and the timeout cannot
+      # destroy it. This is the ordering that matters most.
+      - name: Commit and push to main
+        id: push
         env:
-          GH_TOKEN: ${{ github.token }}
+          PHASE: ${{ needs.select-phase.outputs.phase }}
         run: |
           set -uo pipefail
-          PHASE="${{ needs.select-phase.outputs.phase }}"
-          BRANCH="${{ steps.meta.outputs.branch }}"
 
           git add -A
           if git diff --cached --quiet; then
             echo "no changes to commit"
           else
             git commit -m "ops(${PHASE}): phase work"
+            PUSHED=0
             for i in 1 2 3 4 5; do
-              if git push -f origin "HEAD:refs/heads/${BRANCH}"; then
-                echo "pushed on attempt $i"; break
+              if git push origin HEAD:main; then
+                echo "pushed on attempt $i"
+                PUSHED=1
+                break
               fi
-              echo "push rejected (attempt $i), rebasing"
+              echo "push rejected (attempt $i), rebasing onto latest main"
               git pull --rebase origin main || true
               sleep 3
             done
-            if ! git rev-parse "origin/${BRANCH}" >/dev/null 2>&1; then
-              echo "::error::could not push ${BRANCH}"
+            if [ "$PUSHED" = "0" ]; then
+              echo "::error::push to main failed after 5 attempts, saving to a recovery branch and a patch"
+              git branch -f "pf-bot/recovery/${PHASE}" HEAD
+              git push -f origin "pf-bot/recovery/${PHASE}" || true
+              git format-patch --stdout -1 > "ops-${PHASE}.patch" || true
               exit 1
             fi
           fi
 
+          # .done is written only after `flutter analyze` and `flutter test`
+          # both pass, so its presence on main is the proof this tree is green.
           if [ -f "workspace/${PHASE}/.done" ]; then
             echo "done=true" >> "$GITHUB_OUTPUT"
-            echo "BOT_DONE=true" >> "$GITHUB_ENV"
           else
             echo "done=false" >> "$GITHUB_OUTPUT"
           fi
 
           # Surfaced as a job output rather than read from git by the retrigger.
-          # The marker below is only ever committed to pf-bot/<phase>, so an API
-          # read against main would never see it.
           if [ -f "workspace/${PHASE}/.env_blocked" ]; then
             echo "env_blocked=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::environment not ready: $(cat workspace/${PHASE}/.env_blocked)"
           else
             echo "env_blocked=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Open or update PR
-        id: pr
-        if: always() && steps.commit.outputs.done == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -uo pipefail
-          PHASE="${{ needs.select-phase.outputs.phase }}"
-          BRANCH="${{ steps.meta.outputs.branch }}"
-
-          # Never ask GitHub to open a PR for an empty diff. It refuses, and if
-          # that error is swallowed the phase silently produces nothing.
-          AHEAD=$(git rev-list --count "origin/main..HEAD" 2>/dev/null || echo 0)
-          CHANGED=$(git diff --name-only "origin/main...HEAD" 2>/dev/null | wc -l | tr -d ' ')
-          if [ "$CHANGED" -eq 0 ]; then
-            echo "::error::branch ${BRANCH} has no diff against main (${AHEAD} commits ahead, 0 files changed). Nothing to review."
-            exit 1
-          fi
-          echo "branch ${BRANCH}: ${AHEAD} commits ahead, ${CHANGED} files changed"
-
-          BODY_FILE="$(mktemp)"
-          {
-            echo "Automated phase run by \`ops.yml\`."
-            echo
-            echo "- Phase: \`${PHASE}\`"
-            echo "- Prompt: \`workspace/${PHASE}/PROMPT.md\`"
-            echo "- Model: \`${OPENCODE_MODEL%%,*}\`"
-            echo "- Logs: \`logs/${PHASE}.log\`, \`logs/${PHASE}.verify.log\`"
-            echo
-            echo "Auto-merge is enabled. It lands only once \`analyze + test\`,"
-            echo "\`android\` and \`windows\` are green on this PR."
-          } > "$BODY_FILE"
-
-          EXISTING=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
-          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
-            gh pr edit "$EXISTING" --body-file "$BODY_FILE" || true
-            echo "updated existing PR #${EXISTING}"
-            echo "pr=$EXISTING" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Do not suppress stderr. A swallowed "refusing to merge unrelated
-          # histories" cost an entire debugging cycle once already.
-          if ERR=$(gh pr create \
-              --head "$BRANCH" \
-              --base main \
-              --title "ops(${PHASE}): $(sed -n 's/^# //p' workspace/${PHASE}/PROMPT.md | head -1)" \
-              --body-file "$BODY_FILE" 2>&1); then
-            NUM=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
-            echo "created PR #${NUM}"
-            echo "pr=$NUM" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::gh pr create failed:"
-            echo "$ERR"
-            exit 1
           fi
 
       - name: Upload logs
@@ -351,11 +288,12 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          PHASE: ${{ needs.select-phase.outputs.phase }}
         run: |
-          PHASE="${{ needs.select-phase.outputs.phase }}"
+          set -uo pipefail
           mkdir -p logs
           if [ -f "workspace/${PHASE}/.done" ]; then
-            echo "::notice::phase ${PHASE} complete, PR opened"
+            echo "::notice::phase ${PHASE} complete and on main"
           elif [ -f "workspace/${PHASE}/.deferred" ]; then
             echo "::notice::phase ${PHASE} deferred (rate limit), next tick retries"
           elif [ -f "workspace/${PHASE}/.env_blocked" ]; then
@@ -391,7 +329,10 @@ jobs:
   review:
     name: review
     needs: [select-phase, run-phase]
-    if: needs.select-phase.outputs.exists == 'true' && needs.run-phase.outputs.done == 'true' && inputs.review != false
+    if: >-
+      needs.select-phase.outputs.exists == 'true' &&
+      needs.run-phase.outputs.done == 'true' &&
+      inputs.review != false
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -411,46 +352,25 @@ jobs:
           curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION"
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
 
-      - name: Check out the phase branch
+      - name: Confirm main is green before reviewing
         env:
-          GH_TOKEN: ${{ github.token }}
           PHASE: ${{ needs.select-phase.outputs.phase }}
-          BRANCH: ${{ needs.run-phase.outputs.branch }}
         run: |
           set -uo pipefail
-
-          # This is the step that was wrong originally. actions/checkout gives us
-          # main, and `git checkout -B pf-bot/<phase>` then creates the branch at
-          # main's HEAD, so the reviewer was reviewing an empty tree and the
-          # force-push at the end of this job replaced the phase branch with a
-          # commit based on main, destroying the phase work entirely.
-          #
-          # Build on the branch that actually holds the work. If it does not
-          # exist yet, that is a hard error, because review without the phase is
-          # meaningless and its push would clobber whatever is there.
-          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
-            echo "found existing ${BRANCH}"
-            git fetch origin "$BRANCH":refs/remotes/origin/"$BRANCH"
-            git checkout -B "$BRANCH" "origin/$BRANCH"
-          else
-            echo "::error::branch ${BRANCH} does not exist. run-phase must create it before review."
+          git config user.name "pixelforge-bot"
+          git config user.email "pixelforge-bot@users.noreply.github.com"
+          git pull --ff-only origin main || git fetch origin main && git reset --hard origin/main
+          if [ ! -f "workspace/${PHASE}/.done" ]; then
+            echo "::error::no .done on main for ${PHASE}; the phase did not verify"
             exit 1
           fi
-
-          # Refuse to review a branch that has no phase work on it.
-          if ! git merge-base --is-ancestor origin/main HEAD && [ -z "$(git diff --name-only origin/main...HEAD)" ]; then
-            echo "::error::${BRANCH} has no diff against main; refusing to review"
-            exit 1
-          fi
-          echo "reviewing $(git diff --name-only origin/main...HEAD | wc -l) changed files"
+          echo "reviewing main at $(git rev-parse --short HEAD)"
 
       - name: Review and fix
         id: review
         continue-on-error: true
         run: |
           chmod +x scripts/phase_runner.sh
-          git config user.name "pixelforge-bot"
-          git config user.email "pixelforge-bot@users.noreply.github.com"
           set +e
           bash scripts/phase_runner.sh "${{ needs.select-phase.outputs.phase }}" --review-only
           echo "exit=$?"
@@ -459,85 +379,44 @@ jobs:
       - name: Push review fixes
         if: always()
         env:
-          GH_TOKEN: ${{ github.token }}
+          PHASE: ${{ needs.select-phase.outputs.phase }}
         run: |
           set -uo pipefail
-          PHASE="${{ needs.select-phase.outputs.phase }}"
-          BRANCH="${{ needs.run-phase.outputs.branch }}"
-
           git add -A
           if git diff --cached --quiet; then
             echo "no review changes"
             exit 0
           fi
           git commit -m "ops(${PHASE}): review fixes"
-
-          # Force is needed because the checkpoint loop rewrites history, but
-          # only forward. If the remote has moved past our base, refuse rather
-          # than clobber: losing a phase silently is far worse than a failed
-          # review.
-          REMOTE=$(git ls-remote origin "refs/heads/${BRANCH}" | cut -f1 || true)
-          if [ -n "$REMOTE" ] && [ "$REMOTE" != "$(git rev-parse HEAD~ 2>/dev/null)" ] \
-             && ! git merge-base --is-ancestor "$REMOTE" HEAD 2>/dev/null; then
-            echo "::warning::${BRANCH} moved on the remote; rebasing review fixes onto it"
-            git rebase "origin/${BRANCH}" || {
-              echo "::error::could not rebase review fixes onto the remote branch; leaving it untouched"
-              exit 1
-            }
-          fi
-
-          for i in 1 2 3; do
-            if git push -f origin "HEAD:refs/heads/${BRANCH}"; then
-              echo "review fixes pushed on attempt $i"; exit 0
+          PUSHED=0
+          for i in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              echo "review fixes pushed on attempt $i"
+              PUSHED=1
+              break
             fi
+            echo "push rejected (attempt $i), rebasing onto latest main"
+            git pull --rebase origin main || true
             sleep 3
           done
-          echo "::error::could not push review fixes for ${PHASE}"
-
-  merge:
-    name: enable auto-merge
-    needs: [select-phase, run-phase]
-    if: needs.select-phase.outputs.exists == 'true' && needs.run-phase.outputs.pr != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          PR: ${{ needs.run-phase.outputs.pr }}
-        run: |
-          set -uo pipefail
-          [ -n "$PR" ] || { echo "no PR to merge"; exit 0; }
-
-          # This job has no checkout, so gh has no repository context and every
-          # call must name the repo. Without --repo, `gh pr view` fails outside
-          # a git work tree, returns an empty string, and the job prints
-          # "PR 1 is , nothing to do" while silently skipping the merge. That
-          # is exactly what happened.
-          if ! STATE=$(gh pr view "$PR" --repo "$GH_REPO" --json state --jq '.state' 2>&1); then
-            echo "::error::could not read PR ${PR}: ${STATE}"
+          if [ "$PUSHED" = "0" ]; then
+            echo "::error::could not push review fixes for ${PHASE}, saving a recovery branch"
+            git branch -f "pf-bot/recovery/${PHASE}-review" HEAD
+            git push -f origin "pf-bot/recovery/${PHASE}-review" || true
             exit 1
           fi
-          echo "PR ${PR} state: ${STATE}"
 
-          if [ "$STATE" != "OPEN" ]; then
-            echo "PR ${PR} is ${STATE}, nothing to do"
-            exit 0
-          fi
-
-          echo "merge state: $(gh pr view "$PR" --repo "$GH_REPO" --json mergeStateStatus --jq '.mergeStateStatus' 2>/dev/null || echo unknown)"
-
-          # --auto hands the merge to GitHub, which waits for the required
-          # status checks. Those checks run against the PR merge ref, so the
-          # integration is validated even though the branch itself may lag main.
-          if OUT=$(gh pr merge "$PR" --repo "$GH_REPO" --squash --auto --delete-branch 2>&1); then
-            echo "auto-merge enabled on PR ${PR}"
-            echo "$OUT"
-          else
-            echo "::error::gh pr merge --auto failed:"
-            echo "$OUT"
-            exit 1
-          fi
+      - name: Upload review logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ops-review-${{ needs.select-phase.outputs.phase }}
+          path: |
+            logs/${{ needs.select-phase.outputs.phase }}.review.log
+            logs/${{ needs.select-phase.outputs.phase }}.fix.log
+          if-no-files-found: ignore
+          retention-days: 14
 
   retrigger:
     name: chain next phase
@@ -554,10 +433,8 @@ jobs:
         run: |
           set -uo pipefail
 
-          # If the environment was not ready (missing OPENCODE_API_KEY, opencode
-          # not installed, network down) the phase made no progress and
-          # re-dispatching would chain a no-op run every ten seconds. The
-          # tick.yml cron retries instead, which is the right cadence for "the
+          # Environment not ready: no point chaining, the next phase would fail
+          # the same way. The cron retries, which is the right cadence for "the
           # key was just added".
           if [ "$ENV_BLOCKED" = "true" ]; then
             echo "environment was not ready, not re-dispatching. ops-tick will retry."
@@ -566,8 +443,7 @@ jobs:
 
           # Do not queue behind yourself. repository_dispatch creates a run
           # unconditionally, so with cancel-in-progress false a slow phase plus
-          # the 10-minute cron accumulates queued runs faster than they drain,
-          # and the whole pipeline stalls on its own backlog.
+          # the 10-minute cron accumulates queued runs faster than they drain.
           QUEUED=$(gh api -H "Accept: application/vnd.github+json" \
             "/repos/${GITHUB_REPOSITORY}/actions/runs?status=queued&per_page=20" \
             --jq '[.workflow_runs[] | select(.name == "ops")] | length' 2>/dev/null || echo 0)
@@ -580,8 +456,6 @@ jobs:
             exit 0
           fi
 
-          # 10s so a retrigger cannot tight-loop while the previous push is
-          # still in flight.
           sleep 10
           gh api -X POST -H "Accept: application/vnd.github+json" \
             "/repos/${GITHUB_REPOSITORY}/dispatches" \

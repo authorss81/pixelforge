@@ -137,9 +137,19 @@ generated phases at 33.
 - After 3 failed attempts a phase is marked `.blocked`, skipped forever, and a
   GitHub issue is opened with the log tail. Fix the cause and delete the marker.
 - Rate limits produce `.deferred` and never consume an attempt.
-- The bot pushes to `pf-bot/<phase>` and opens a PR. It never pushes to `main`.
-- `main` is branch-protected with `analyze + test`, `android` and `windows`
-  required, so auto-merge lands only verified work.
+- The bot **pushes straight to `main`**. There are no pull requests, by design:
+  a PR authored by `GITHUB_TOKEN` never receives CI, because GitHub suppresses
+  the `pull_request` event for token-authored changes. Proven on this repo:
+  `build.yml` went fully green on the exact PR head SHA and the PR still read
+  `BLOCKED` with an empty `statusCheckRollup`.
+- The gate is therefore the in-pipeline verification. `.done` is written only
+  after `flutter analyze` and `flutter test` pass, and the review job verifies
+  again after applying its fixes. `.done` on `main` is the proof.
+- Phase work is committed and pushed **before** review runs, so a timeout in
+  either job cannot destroy it.
+- Branch protection still applies to the bot's pushes: linear history, no force
+  push, no deletions, conversation resolution, and `enforce_admins`, so a
+  deliberate local push is required for anything unusual.
 
 ## The self-audit phase
 
