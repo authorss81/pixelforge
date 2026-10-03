@@ -18,21 +18,30 @@ class ImageJob extends ChangeNotifier {
   JobStatus _status = JobStatus.queued;
   Uint8List? _output;
   String? _error;
+  String? _notice;
   int? _sourceWidth;
   int? _sourceHeight;
   int? _outWidth;
   int? _outHeight;
   int? _solvedQuality;
+  int _outFrames = 1;
   double _progress = 0;
 
   JobStatus get status => _status;
   Uint8List? get output => _output;
   String? get error => _error;
+
+  /// Non-fatal loss the user should know about, e.g. an animation flattened to
+  /// one frame because the chosen container cannot hold more.
+  String? get notice => _notice;
   int? get sourceWidth => _sourceWidth;
   int? get sourceHeight => _sourceHeight;
   int? get outWidth => _outWidth;
   int? get outHeight => _outHeight;
   int? get solvedQuality => _solvedQuality;
+
+  /// How many frames the output holds. Above one means the animation survived.
+  int get outFrames => _outFrames;
   double get progress => _progress;
 
   int get inputBytes => bytes.length;
@@ -75,19 +84,24 @@ class ImageJob extends ChangeNotifier {
     required int width,
     required int height,
     int? quality,
+    int frames = 1,
+    String? notice,
   }) {
     _output = output;
     _outWidth = width;
     _outHeight = height;
     _solvedQuality = quality;
+    _outFrames = frames < 1 ? 1 : frames;
     _status = JobStatus.done;
     _progress = 1;
     _error = null;
+    _notice = notice;
     notifyListeners();
   }
 
   void markFailed(String message) {
     _error = message;
+    _notice = null;
     _status = JobStatus.failed;
     _progress = 1;
     notifyListeners();
@@ -104,8 +118,10 @@ class ImageJob extends ChangeNotifier {
     _status = JobStatus.queued;
     _output = null;
     _error = null;
+    _notice = null;
     _progress = 0;
     _solvedQuality = null;
+    _outFrames = 1;
     notifyListeners();
   }
 }
