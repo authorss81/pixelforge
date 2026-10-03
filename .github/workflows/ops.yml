@@ -83,7 +83,7 @@ jobs:
 
           while read -r name; do
             [ -n "$name" ] || continue
-            for m in done blocked deferred attempts; do
+            for m in done blocked deferred attempts terminal; do
               grep -qx "workspace/${name}/.${m}" /tmp/tree.txt && touch "/tmp/phases/${name}.${m}"
             done
           done < /tmp/phase_names.txt
@@ -114,14 +114,39 @@ jobs:
           fi
 
           # A deferred phase is a rate limit from a previous tick. Take it first
-          # so a single limit does not block the whole queue behind it.
+          # so a single limit does not block the whole queue behind it. A
+          # deferred *terminal* phase waits its turn, see pass 2 below.
           for d in $(ls /tmp/phases/*.deferred 2>/dev/null | sort -V); do
-            emit "$(basename "$d" .deferred)"
+            n="$(basename "$d" .deferred)"
+            [ -f "/tmp/phases/${n}.terminal" ] && continue
+            emit "$n"
+            exit 0
+          done
+
+          # Pass 1: lowest ordinary phase still outstanding.
+          while read -r name; do
+            [ -n "$name" ] || continue
+            [ -f "/tmp/phases/${name}.terminal" ] && continue
+            if [ ! -f "/tmp/phases/${name}.done" ] && [ ! -f "/tmp/phases/${name}.blocked" ]; then
+              emit "$name"
+              exit 0
+            fi
+          done < /tmp/phase_names.txt
+
+          # Pass 2: only once the ordinary queue is empty does a terminal phase
+          # run. This is what lets the release build be the last thing that
+          # happens while still letting the audit append work afterwards, since
+          # any new ordinary phase pushes the terminal phase back to the end.
+          for d in $(ls /tmp/phases/*.deferred 2>/dev/null | sort -V); do
+            n="$(basename "$d" .deferred)"
+            [ -f "/tmp/phases/${n}.terminal" ] || continue
+            emit "$n"
             exit 0
           done
 
           while read -r name; do
             [ -n "$name" ] || continue
+            [ -f "/tmp/phases/${name}.terminal" ] || continue
             if [ ! -f "/tmp/phases/${name}.done" ] && [ ! -f "/tmp/phases/${name}.blocked" ]; then
               emit "$name"
               exit 0
@@ -133,7 +158,7 @@ jobs:
             echo "::warning::${BLOCKED} blocked phase(s) awaiting a human: $(ls /tmp/phases/*.blocked 2>/dev/null | xargs -n1 basename | sed 's/.blocked//' | tr '\n' ' ')"
           fi
 
-          echo "all phases done"
+          echo "all phases resolved, pipeline complete"
           echo "exists=false" >> "$GITHUB_OUTPUT"
 
   run-phase:
@@ -238,14 +263,22 @@ jobs:
       - name: Open or update PR
         id: pr
         if: always() && steps.commit.outputs.done == 'true'
-        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
           PHASE="${{ needs.select-phase.outputs.phase }}"
           BRANCH="${{ steps.meta.outputs.branch }}"
-          mkdir -p .github
+
+          # Never ask GitHub to open a PR for an empty diff. It refuses, and if
+          # that error is swallowed the phase silently produces nothing.
+          AHEAD=$(git rev-list --count "origin/main..HEAD" 2>/dev/null || echo 0)
+          CHANGED=$(git diff --name-only "origin/main...HEAD" 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$CHANGED" -eq 0 ]; then
+            echo "::error::branch ${BRANCH} has no diff against main (${AHEAD} commits ahead, 0 files changed). Nothing to review."
+            exit 1
+          fi
+          echo "branch ${BRANCH}: ${AHEAD} commits ahead, ${CHANGED} files changed"
 
           BODY_FILE="$(mktemp)"
           {
@@ -262,16 +295,26 @@ jobs:
 
           EXISTING=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
           if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
-            gh pr edit "$EXISTING" --body-file "$BODY_FILE" >/dev/null 2>&1 || true
+            gh pr edit "$EXISTING" --body-file "$BODY_FILE" || true
+            echo "updated existing PR #${EXISTING}"
             echo "pr=$EXISTING" >> "$GITHUB_OUTPUT"
-          else
-            gh pr create \
+            exit 0
+          fi
+
+          # Do not suppress stderr. A swallowed "refusing to merge unrelated
+          # histories" cost an entire debugging cycle once already.
+          if ERR=$(gh pr create \
               --head "$BRANCH" \
               --base main \
               --title "ops(${PHASE}): $(sed -n 's/^# //p' workspace/${PHASE}/PROMPT.md | head -1)" \
-              --body-file "$BODY_FILE" >/dev/null 2>&1 || true
+              --body-file "$BODY_FILE" 2>&1); then
             NUM=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
+            echo "created PR #${NUM}"
             echo "pr=$NUM" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::gh pr create failed:"
+            echo "$ERR"
+            exit 1
           fi
 
       - name: Upload logs
@@ -348,6 +391,39 @@ jobs:
           curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION"
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
 
+      - name: Check out the phase branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PHASE: ${{ needs.select-phase.outputs.phase }}
+          BRANCH: ${{ needs.run-phase.outputs.branch }}
+        run: |
+          set -uo pipefail
+
+          # This is the step that was wrong originally. actions/checkout gives us
+          # main, and `git checkout -B pf-bot/<phase>` then creates the branch at
+          # main's HEAD, so the reviewer was reviewing an empty tree and the
+          # force-push at the end of this job replaced the phase branch with a
+          # commit based on main, destroying the phase work entirely.
+          #
+          # Build on the branch that actually holds the work. If it does not
+          # exist yet, that is a hard error, because review without the phase is
+          # meaningless and its push would clobber whatever is there.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "found existing ${BRANCH}"
+            git fetch origin "$BRANCH":refs/remotes/origin/"$BRANCH"
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            echo "::error::branch ${BRANCH} does not exist. run-phase must create it before review."
+            exit 1
+          fi
+
+          # Refuse to review a branch that has no phase work on it.
+          if ! git merge-base --is-ancestor origin/main HEAD && [ -z "$(git diff --name-only origin/main...HEAD)" ]; then
+            echo "::error::${BRANCH} has no diff against main; refusing to review"
+            exit 1
+          fi
+          echo "reviewing $(git diff --name-only origin/main...HEAD | wc -l) changed files"
+
       - name: Review and fix
         id: review
         continue-on-error: true
@@ -355,7 +431,6 @@ jobs:
           chmod +x scripts/phase_runner.sh
           git config user.name "pixelforge-bot"
           git config user.email "pixelforge-bot@users.noreply.github.com"
-          git checkout -B "pf-bot/${{ needs.select-phase.outputs.phase }}"
           set +e
           bash scripts/phase_runner.sh "${{ needs.select-phase.outputs.phase }}" --review-only
           echo "exit=$?"
@@ -368,19 +443,33 @@ jobs:
         run: |
           set -uo pipefail
           PHASE="${{ needs.select-phase.outputs.phase }}"
-          BRANCH="${{ steps.meta_branch.outputs.branch }}"
-          BRANCH="pf-bot/${PHASE}"
+          BRANCH="${{ needs.run-phase.outputs.branch }}"
+
           git add -A
           if git diff --cached --quiet; then
             echo "no review changes"
             exit 0
           fi
           git commit -m "ops(${PHASE}): review fixes"
-          for i in 1 2 3 4 5; do
+
+          # Force is needed because the checkpoint loop rewrites history, but
+          # only forward. If the remote has moved past our base, refuse rather
+          # than clobber: losing a phase silently is far worse than a failed
+          # review.
+          REMOTE=$(git ls-remote origin "refs/heads/${BRANCH}" | cut -f1 || true)
+          if [ -n "$REMOTE" ] && [ "$REMOTE" != "$(git rev-parse HEAD~ 2>/dev/null)" ] \
+             && ! git merge-base --is-ancestor "$REMOTE" HEAD 2>/dev/null; then
+            echo "::warning::${BRANCH} moved on the remote; rebasing review fixes onto it"
+            git rebase "origin/${BRANCH}" || {
+              echo "::error::could not rebase review fixes onto the remote branch; leaving it untouched"
+              exit 1
+            }
+          fi
+
+          for i in 1 2 3; do
             if git push -f origin "HEAD:refs/heads/${BRANCH}"; then
               echo "review fixes pushed on attempt $i"; exit 0
             fi
-            git pull --rebase origin main || true
             sleep 3
           done
           echo "::error::could not push review fixes for ${PHASE}"

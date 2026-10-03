@@ -124,7 +124,15 @@ State lives in git, not in CI:
 | `workspace/<phase>/.no_work` | agent exited 0 but changed nothing |
 | `workspace/<phase>/.session` | opencode session id |
 | `workspace/<phase>/.timeout` | optional runner timeout, default 90 min |
+| `workspace/<phase>/.terminal` | runs only after every ordinary phase is `.done` |
 | `workspace/.stop` | halts the entire pipeline |
+
+Selection is two-pass: the lowest ordinary phase without `.done` or `.blocked`
+wins; only when no ordinary phase remains does a `.terminal` phase run. That is
+how the release build stays last while the audit can still append work, since
+any new ordinary phase pushes the terminal phase back to the end. `phase-32` is
+the terminal release build and its number is **reserved** — the audit starts its
+generated phases at 33.
 
 - After 3 failed attempts a phase is marked `.blocked`, skipped forever, and a
   GitHub issue is opened with the log tail. Fix the cause and delete the marker.
@@ -142,10 +150,13 @@ The last declared phase is an audit, not an implementation. It must:
 3. Hunt for new instances of the known failure classes.
 4. Re-verify the privacy invariants.
 5. Write `workspace/<phase>/AUDIT_REPORT.md`.
-6. **Generate new `workspace/phase-NN/PROMPT.md` files**, numbered from the next
-   free integer, at most 8 of them, highest severity first.
+6. **Generate new `workspace/phase-NN/PROMPT.md` files**, numbered from **33**,
+   at most 8 of them, highest severity first. `phase-32` is reserved for the
+   terminal release build and must never be emitted.
 
-Because phase selection is "lowest phase without `.done`", newly generated
-phases are picked up automatically and the loop continues without intervention.
+Because phase selection is "lowest ordinary phase without `.done`", newly
+generated phases are picked up automatically and the loop continues without
+intervention. Once the ordinary queue empties, the terminal release phase runs
+and the loop ends.
 
 The audit must never generate a phase that weakens the offline guarantee.

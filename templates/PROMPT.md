@@ -2,6 +2,7 @@
 
 **Roadmap:** <P-tier.item, e.g. P0.1>
 **Depends on:** <phase-NN or nothing>
+**Terminal:** <yes, if this must run only after every ordinary phase is done>
 
 ## Goal
 

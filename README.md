@@ -118,13 +118,33 @@ state. See [AGENTS.md](AGENTS.md) for the full protocol.
 | `workspace/<phase>/.deferred` | rate limited; retried, and never costs an attempt |
 | `workspace/<phase>/.no_work` | agent exited 0 but changed nothing |
 | `workspace/<phase>/.timeout` | optional per-phase runner timeout, default 90 min |
+| `workspace/<phase>/.terminal` | runs last, after every ordinary phase |
 | `workspace/.stop` | halts the whole pipeline |
 
 The 31 declared phases live in `workspace/phase-01` through `workspace/phase-31`.
 `phase-31` is the self-audit: it measures reality with the benchmark harness,
 checks every roadmap claim against the code, re-verifies the privacy invariants,
-writes `AUDIT_REPORT.md`, and **generates new phase prompts**. Because selection
-is "lowest phase without `.done`", generated phases are picked up automatically.
+writes `AUDIT_REPORT.md`, and **generates new phase prompts starting at 33**.
+Because selection is "lowest ordinary phase without `.done`", generated phases
+are picked up automatically.
+
+`phase-32` is marked `.terminal`. Terminal phases run only after every ordinary
+phase is done, so the release build is always last — and if the audit appends
+more work, the terminal phase is pushed back to the end rather than firing
+prematurely. `phase-32` builds the release APK, split-ABI APKs, the Play bundle
+and the Windows zip, verifies the APK really requests zero permissions, and
+attaches everything to a **draft** release. Its number is reserved: the audit is
+instructed to start at 33.
+
+### Selection order
+
+```
+1. workspace/.stop present              -> halt
+2. lowest .deferred, non-terminal       -> rate-limit retry
+3. lowest ordinary phase, no .done      -> the next unit of work
+4. lowest .terminal phase, no .done     -> only once step 3 is exhausted
+5. nothing outstanding                  -> pipeline complete
+```
 
 ### Running it
 
