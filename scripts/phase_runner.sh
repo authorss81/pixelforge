@@ -54,6 +54,12 @@ WIP_BRANCH_PREFIX="${WIP_BRANCH_PREFIX:-pf-bot/wip}"
 REVIEWER_AGENT="${REVIEWER_AGENT:-reviewer}"
 BUILD_AGENT="${BUILD_AGENT:-build}"
 
+# Checkpoints are attempt-scoped. A single shared wip branch means a retry
+# force-pushes over the previous attempt's work, so a phase that fails twice
+# loses attempt one entirely. Scoping by attempt makes every attempt's work
+# independently recoverable.
+WIP_BRANCH=""
+
 # Primary model first, then the free-tier fallback chain. The runner advances
 # only on MODEL-level failures, never on a real work failure.
 MODELS_RAW="${OPENCODE_MODEL:-opencode/space-bunny-free}"
@@ -69,7 +75,10 @@ die()  { log "FATAL: $*"; exit 1; }
 ensure_log_dir() { mkdir -p "$LOG_DIR"; }
 
 marker_paths() {
-  echo "logs/|workspace/\.|^workspace/[^/]+/\.|\.log$|wip/|pf-bot/"
+  # Matches marker and scratch paths in both `git status --porcelain` output
+  # (which prefixes every line with a 2-char status, so nothing may be
+  # start-anchored) and `git diff --name-only` output (which has no prefix).
+  echo "logs/|workspace/[^/]+/\.|\.log$|wip/|pf-bot/"
 }
 
 # Does this phase have real work?
@@ -82,7 +91,7 @@ marker_paths() {
 # measured across the whole phase regardless of checkpoint timing.
 tree_has_real_work() {
   local st committed
-  st="$(git status --porcelain | grep -Ev "$(marker_paths)" | grep -Ev '^\?\? logs/' || true)"
+  st="$(git status --porcelain --untracked-files=all | grep -Ev "$(marker_paths)" | grep -Ev '^\?\? logs/' || true)"
   [ -n "$st" ] && return 0
   if [ -n "${PHASE_BASE:-}" ]; then
     committed="$(git diff --name-only "$PHASE_BASE" HEAD 2>/dev/null | grep -Ev "$(marker_paths)" || true)"
@@ -94,7 +103,7 @@ tree_has_real_work() {
 # Files the phase actually touched, for the log.
 phase_touched_files() {
   {
-    git status --porcelain | grep -Ev "$(marker_paths)" | grep -Ev '^\?\? logs/' || true
+    git status --porcelain --untracked-files=all | grep -Ev "$(marker_paths)" | grep -Ev '^\?\? logs/' || true
     if [ -n "${PHASE_BASE:-}" ]; then
       git diff --name-only "$PHASE_BASE" HEAD 2>/dev/null | grep -Ev "$(marker_paths)" || true
     fi
@@ -176,11 +185,66 @@ checkpoint_loop() {
       git add -A >/dev/null 2>&1 || true
       if ! git diff --cached --quiet 2>/dev/null; then
         git commit -q -m "wip(${PHASE}): checkpoint" >/dev/null 2>&1 || true
-        git push -q -f origin "HEAD:refs/heads/${WIP_BRANCH_PREFIX}/${PHASE}" >/dev/null 2>&1 || true
-        log "checkpoint committed and pushed to ${WIP_BRANCH_PREFIX}/${PHASE}"
+        git push -q -f origin "HEAD:refs/heads/${WIP_BRANCH}" >/dev/null 2>&1 || true
+        log "checkpoint pushed to ${WIP_BRANCH}"
       fi
     fi
   done
+}
+
+# Push whatever exists, right now, whatever state we are in. Called from an EXIT
+# trap so a phase that is killed, times out, or fails still leaves its work
+# recoverable on the remote.
+final_checkpoint() {
+  [ -n "${CHECKPOINT_PID:-}" ] && kill "$CHECKPOINT_PID" >/dev/null 2>&1
+  if tree_has_real_work; then
+    git add -A >/dev/null 2>&1 || true
+    if ! git diff --cached --quiet 2>/dev/null; then
+      git commit -q -m "wip(${PHASE}): final checkpoint" >/dev/null 2>&1 || true
+    fi
+  fi
+  if [ -n "${PHASE_BASE:-}" ] && [ -n "$(git diff --name-only "$PHASE_BASE" HEAD 2>/dev/null)" ]; then
+    git push -q -f origin "HEAD:refs/heads/${WIP_BRANCH}" >/dev/null 2>&1 \
+      && log "work preserved on ${WIP_BRANCH}" \
+      || warn "could not push ${WIP_BRANCH}; work exists only on this runner"
+  fi
+}
+
+# Restore the furthest-along recoverable state for this phase, so a retry
+# continues instead of starting over. Checks the recovery branch first, then the
+# highest-numbered attempt checkpoint.
+restore_previous_attempt() {
+  local ref base
+  for ref in "refs/heads/pf-bot/recovery/${PHASE}" \
+             "refs/heads/${WIP_BRANCH_PREFIX}/${PHASE}-review"; do
+    git fetch --quiet origin "$ref:refs/remotes/recover/$(basename "$ref")" 2>/dev/null || continue
+    base="$(git rev-parse --verify "refs/remotes/recover/$(basename "$ref")" 2>/dev/null || true)"
+    [ -n "$base" ] || continue
+    if [ -n "$(git diff --name-only "origin/main...$base" 2>/dev/null | grep -Ev "$(marker_paths)")" ]; then
+      git reset --hard "$base" >/dev/null 2>&1
+      log "resumed from $(basename "$ref")"
+      return 0
+    fi
+  done
+
+  # Latest attempt checkpoint for this phase.
+  local best=""
+  while read -r r; do
+    [ -n "$r" ] || continue
+    git fetch --quiet origin "$r:refs/remotes/recover/$(basename "$r")" 2>/dev/null || continue
+    local c
+    c="$(git rev-parse --verify "refs/remotes/recover/$(basename "$r")" 2>/dev/null || true)"
+    [ -n "$c" ] || continue
+    if [ -z "$best" ] || [ "$(git rev-list --count "$best..$c" 2>/dev/null || echo 0)" -gt 0 ]; then
+      best="$c"
+    fi
+  done < <(git ls-remote --heads origin "refs/heads/${WIP_BRANCH_PREFIX}/${PHASE}-a*" 2>/dev/null | awk '{print $2}')
+
+  if [ -n "$best" ]; then
+    git reset --hard "$best" >/dev/null 2>&1
+    log "resumed from a previous attempt checkpoint"
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -295,20 +359,43 @@ run_phase() {
     return 6
   fi
 
+  trap final_checkpoint EXIT
+
+  # Continue from whatever a previous attempt left behind rather than redoing it.
+  # This must happen BEFORE the attempt counter is touched. It ends in
+  # `git reset --hard`, which discards the working tree, so incrementing first
+  # would silently erase the increment and the phase would never reach the
+  # attempt cap.
+  restore_previous_attempt
+
+  # Re-check after the restore, which may have brought in a .done or .blocked.
+  if [ -f "$DONE_FILE" ]; then
+    log "already .done after restore, nothing to do"
+    return 0
+  fi
+  if [ -f "$BLOCKED_FILE" ]; then
+    log "already .blocked after restore, skipping"
+    return 6
+  fi
+
   local attempt
   attempt=$(( $(read_attempts "$ATTEMPTS_FILE") + 1 ))
   echo "$attempt" > "$ATTEMPTS_FILE"
   rm -f "$DEFERRED_FILE" "$NO_WORK_FILE"
-  log "attempt ${attempt} of ${MAX_ATTEMPTS}"
 
-  # Baseline for work detection. Must be captured before the agent runs,
-  # otherwise a checkpoint commit looks like the starting point.
+  # Per-attempt checkpoint branch, so a retry cannot destroy the previous
+  # attempt's recoverable state.
+  WIP_BRANCH="${WIP_BRANCH_PREFIX}/${PHASE}-a${attempt}"
+  log "attempt ${attempt} of ${MAX_ATTEMPTS}, checkpoints -> ${WIP_BRANCH}"
+
+  # Baseline for work detection. After any restore, otherwise a checkpoint
+  # commit looks like the starting point.
   PHASE_BASE="$(git rev-parse HEAD)"
 
   build_context_header
 
   checkpoint_loop &
-  local checkpoint_pid=$!
+  CHECKPOINT_PID=$!
 
   local code
   set +e
@@ -318,7 +405,8 @@ run_phase() {
   code=$?
   set -e
 
-  kill "$checkpoint_pid" >/dev/null 2>&1 || true
+  kill "$CHECKPOINT_PID" >/dev/null 2>&1 || true
+  CHECKPOINT_PID=""
 
   if [ -n "$ACTIVE_MODEL" ]; then
     log "model used: $ACTIVE_MODEL"
@@ -470,5 +558,12 @@ main() {
   return "$code"
 }
 
-main
-exit $?
+# When PHASE_RUNNER_SOURCED=1 the file defines its functions without executing.
+# That is the only supported way to test this script. Running the full runner
+# against a stubbed agent exercises the integration, but unit checks on the
+# classifiers, the marker accounting and the work detection must not depend on
+# background loops, traps or sleeps.
+if [ "${PHASE_RUNNER_SOURCED:-}" != "1" ]; then
+  main
+  exit $?
+fi

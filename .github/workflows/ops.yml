@@ -53,6 +53,11 @@ permissions:
   contents: write
   issues: write
   checks: read
+  # Required so a phase can edit a workflow file. Without it every push touching
+  # .github/workflows/** is rejected with "refusing to allow a GitHub App to
+  # create or update workflow ... without workflows permission", which is how
+  # phase-02 lost its work five times over.
+  workflows: write
 
 concurrency:
   group: ops-pipeline
