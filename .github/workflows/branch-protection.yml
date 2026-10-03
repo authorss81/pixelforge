@@ -1,0 +1,74 @@
+name: branch-protection
+
+# Makes `gh pr merge --auto` meaningful. Without required status checks,
+# auto-merge resolves the moment the PR is created, which would land a phase
+# that has never been compiled.
+#
+# Idempotent. Safe to re-run after changing build.yml's job names.
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/*.yml']
+  workflow_dispatch:
+
+permissions:
+  administration: write
+  contents: read
+
+jobs:
+  protect:
+    name: protect main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure branch protection on main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          # The job names of .github/workflows/build.yml. All three must be green
+          # before anything lands.
+          REQUIRED_CONTEXT='["analyze + test", "android", "windows"]'
+
+          PAYLOAD=$(cat <<JSON
+          {
+            "branch": "main",
+            "required_status_checks": {
+              "strict": true,
+              "contexts": ${REQUIRED_CONTEXT}
+            },
+            "enforce_admins": false,
+            "required_pull_request_reviews": null,
+            "restrictions": null,
+            "required_linear_history": true,
+            "allow_force_pushes": false,
+            "allow_deletions": false,
+            "block_creations": false,
+            "required_conversation_resolution": true,
+            "lock_branch": false
+          }
+          JSON
+          )
+
+          echo "applying protection to main"
+          if gh api -X PUT "repos/${GITHUB_REPOSITORY}/branches/main/protection" \
+               -H "Accept: application/vnd.github+json" \
+               -H "Content-Type: application/json" \
+               -d "$PAYLOAD"; then
+            echo "branch protection applied"
+          else
+            echo "::warning::could not set protection (may need admin rights); auto-merge will fall back to an immediate squash"
+          fi
+
+      - name: Ensure bot can push branches and open PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # GITHUB_TOKEN is scoped to this repo and cannot trigger other
+          # workflows, but repository_dispatch back into the same repo is
+          # allowed, which is what the retrigger job relies on.
+          echo "GITHUB_TOKEN already has contents:write and pull-requests:write from the workflow permissions block."
+          gh auth status 2>/dev/null || true

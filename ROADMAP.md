@@ -3,6 +3,45 @@
 Everything that would take this from a working v1 to a world-class image
 resizer. Ordered by what actually blocks users, not by what is fun to build.
 
+**This file is machine-maintained.** Every item below is mapped to an
+autonomous phase in `workspace/phase-NN/PROMPT.md`, and `phase-31` audits this
+document against the code and rewrites it. Do not hand-edit a checkbox to mark
+work done; let the audit do it, or the loop loses its ground truth.
+
+| Phase | Tier | Item |
+|---|---|---|
+| 01 | P0 | Animated GIF/WebP preservation |
+| 02 | P0 | Real release signing |
+| 03 | P0 | Missing iOS target |
+| 04 | P0 | Byte-budget solver on a proxy |
+| 05 | P0 | Selective EXIF control |
+| 06 | P0 | DCT-scaled decode |
+| 07 | P0 | 16-bit, CMYK, TIFF pages |
+| 08 | P1 | Isolate worker pool |
+| 09 | P1 | Streaming results, bounded memory |
+| 10 | P1 | Multi-output from one decode |
+| 11 | P1 | Real cancellation |
+| 12 | P1 | Benchmark harness |
+| 13 | P1 | Indexed-GIF resampling |
+| 14 | P2 | HEIC/AVIF on Android |
+| 15 | P2 | HEIC on iOS |
+| 16 | P2 | HEIC/AVIF on desktop via libheif |
+| 17 | P2 | Photo Picker |
+| 18 | P2 | Share intent, save to gallery |
+| 19 | P2 | Background processing |
+| 20 | P3 | Live preview |
+| 21 | P3 | Before/after drag divider |
+| 22 | P3 | Multi-output UI |
+| 23 | P3 | Design tokens, a11y, RTL |
+| 24 | P3 | Golden tests |
+| 25 | P4 | Onboarding, auto-save, errors, shortcuts |
+| 26 | P5 | PDF in/out |
+| 27 | P5 | ZIP bundle output |
+| 28 | P5 | Face-aware smart crop |
+| 29 | P6 | Store readiness |
+| 30 | P6 | Offline crash log, CI smoke test |
+| 31 | AUDIT | Self-audit, generates phases 32+ |
+
 Status legend: `[ ]` todo · `[~]` in progress · `[x]` done
 
 Current state: analyzer clean, 30 tests green, CI green for analyze/test,

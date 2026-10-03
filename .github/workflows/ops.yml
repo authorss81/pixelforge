@@ -1,0 +1,423 @@
+name: ops
+
+# Self-dispatching phase runner.
+#
+#   select-phase  picks the lowest phase in workspace/ that has neither .done nor
+#                 .blocked, reading markers through the GitHub API with no
+#                 checkout so an idle tick costs only VM boot.
+#   run-phase     installs Flutter and opencode, runs scripts/phase_runner.sh,
+#                 pushes the result to pf-bot/<phase> and opens a PR.
+#   review        a separate job with its own budget, so a slow phase can never
+#                 starve it. Never invalidates a phase that already passed.
+#   merge         enables GitHub auto-merge. main is branch-protected with the
+#                 build.yml checks required, so a red phase opens an issue
+#                 instead of landing.
+#   retrigger     POSTs repository_dispatch back to this workflow ~10s after
+#                 each run, chaining the loop without waiting for cron.
+#
+# llops-tick.yml is the 5-minute cron safety net for when the retrigger fails.
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: 'Force a phase (e.g. phase-05). Empty = auto-select.'
+        required: false
+        default: ''
+      review:
+        description: 'Run the reviewer subagent after the phase'
+        required: false
+        type: boolean
+        default: true
+  repository_dispatch:
+    types: [ops_tick]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  checks: read
+
+concurrency:
+  group: ops-pipeline
+  # false on purpose. phase_runner.sh checkpoints to pf-bot/wip/<phase> every
+  # 300s, but work done between two checkpoints lives only in the working tree.
+  # Cancelling in that window would destroy it. With false, a new tick queues
+  # and starts after the prior run's push step has completed.
+  cancel-in-progress: false
+
+env:
+  OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+  # Primary is space-bunny-free. The rest are free-tier fallbacks, ranked by
+  # coding benchmarks. phase_runner.sh advances down this chain ONLY on
+  # model-level failures (rate limit, provider outage, unknown id, no output),
+  # never on a real work failure.
+  OPENCODE_MODEL: >-
+    opencode/space-bunny-free,opencode/muse-spark-1.3-contributor-free,opencode/muse-spark-1.2-contributor-free,opencode/big-pickle,openrouter/poolside/laguna-s-2.1:free,openrouter/thinkingmachines/inkling:free,opencode/nemotron-3-ultra-free,openrouter/nvidia/nemotron-3-ultra-550b-a55b:free,openrouter/nvidia/nemotron-3-super-120b-a12b:free,openrouter/thinkingmachines/inkling-small:free,opencode/mimo-v2.5-free,opencode/nemotron-3.5-lightning-free,openrouter/nemotron-3.5-lightning:free,openrouter/nemotron-3-nano-omni-30b-a3b-reasoning:free,openrouter/cohere/north-mini-code:free,opencode/ling-3.0-flash-fin-free,openrouter/poolside/laguna-xs-2.1:free,openrouter/google/gemma-4-31b-it:free,openrouter/nex-agi/nex-n2.5-pro:free,openrouter/liquid/lfm-2.5-2.6b:free,openrouter/free
+  FLUTTER_VERSION: 3.44.8
+  OPENCODE_VERSION: 1.15.12
+
+jobs:
+  select-phase:
+    name: select phase
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      phase: ${{ steps.phase.outputs.phase }}
+      exists: ${{ steps.phase.outputs.exists }}
+      timeout: ${{ steps.phase.outputs.timeout }}
+    steps:
+      - id: phase
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCED: ${{ inputs.phase }}
+        run: |
+          set -uo pipefail
+
+          gh api "repos/${GITHUB_REPOSITORY}/git/trees/HEAD?recursive=1" \
+            --jq '.tree[].path' > /tmp/tree.txt || { echo "exists=false" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          mkdir -p /tmp/phases
+          grep -E '^workspace/phase-[0-9]+/' /tmp/tree.txt | cut -d/ -f2 | sort -V -u > /tmp/phase_names.txt
+          [ -s /tmp/phase_names.txt ] || { echo "no phases declared"; echo "exists=false" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          while read -r name; do
+            [ -n "$name" ] || continue
+            for m in done blocked deferred attempts; do
+              grep -qx "workspace/${name}/.${m}" /tmp/tree.txt && touch "/tmp/phases/${name}.${m}"
+            done
+          done < /tmp/phase_names.txt
+
+          phase_timeout() {
+            local t
+            t="$(gh api "repos/${GITHUB_REPOSITORY}/contents/workspace/$1/.timeout" \
+                  --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -dc '0-9')"
+            if [ -n "$t" ] && [ "$t" -ge 1 ] 2>/dev/null; then printf '%s' "$t"; else printf '90'; fi
+          }
+
+          emit() {
+            echo "phase=$1"     >> "$GITHUB_OUTPUT"
+            echo "exists=true"  >> "$GITHUB_OUTPUT"
+            echo "timeout=$(phase_timeout "$1")" >> "$GITHUB_OUTPUT"
+          }
+
+          if [ -n "$FORCED" ]; then
+            echo "manual override"
+            emit "$FORCED"
+            exit 0
+          fi
+
+          if grep -qx "workspace/.stop" /tmp/tree.txt; then
+            echo "::notice::workspace/.stop present, pipeline halted"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A deferred phase is a rate limit from a previous tick. Take it first
+          # so a single limit does not block the whole queue behind it.
+          for d in $(ls /tmp/phases/*.deferred 2>/dev/null | sort -V); do
+            emit "$(basename "$d" .deferred)"
+            exit 0
+          done
+
+          while read -r name; do
+            [ -n "$name" ] || continue
+            if [ ! -f "/tmp/phases/${name}.done" ] && [ ! -f "/tmp/phases/${name}.blocked" ]; then
+              emit "$name"
+              exit 0
+            fi
+          done < /tmp/phase_names.txt
+
+          BLOCKED=$(ls /tmp/phases/*.blocked 2>/dev/null | wc -l)
+          if [ "${BLOCKED}" -gt 0 ]; then
+            echo "::warning::${BLOCKED} blocked phase(s) awaiting a human: $(ls /tmp/phases/*.blocked 2>/dev/null | xargs -n1 basename | sed 's/.blocked//' | tr '\n' ' ')"
+          fi
+
+          echo "all phases done"
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+
+  run-phase:
+    name: run phase
+    needs: select-phase
+    if: needs.select-phase.outputs.exists == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(needs.select-phase.outputs.timeout) }}
+    outputs:
+      phase: ${{ steps.meta.outputs.phase }}
+      branch: ${{ steps.meta.outputs.branch }}
+      done: ${{ steps.commit.outputs.done }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install opencode
+        run: |
+          set -euo pipefail
+          curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION"
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.opencode/bin:$PATH"
+          opencode --version
+
+      - name: Meta
+        id: meta
+        run: |
+          PHASE="${{ needs.select-phase.outputs.phase }}"
+          echo "phase=${PHASE}" >> "$GITHUB_OUTPUT"
+          echo "branch=pf-bot/${PHASE}" >> "$GITHUB_OUTPUT"
+          git config user.name "pixelforge-bot"
+          git config user.email "pixelforge-bot@users.noreply.github.com"
+          git checkout -B "pf-bot/${PHASE}"
+
+      - name: Run phase
+        id: run
+        continue-on-error: true
+        env:
+          MAX_ATTEMPTS: 3
+          CHECKPOINT_SECONDS: 300
+        run: |
+          chmod +x scripts/phase_runner.sh
+          set +e
+          bash scripts/phase_runner.sh "${{ needs.select-phase.outputs.phase }}"
+          echo "exit=$?"
+          exit 0
+
+      - name: Commit and push branch
+        id: commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          PHASE="${{ needs.select-phase.outputs.phase }}"
+          BRANCH="${{ steps.meta.outputs.branch }}"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no changes to commit"
+          else
+            git commit -m "ops(${PHASE}): phase work"
+            for i in 1 2 3 4 5; do
+              if git push -f origin "HEAD:refs/heads/${BRANCH}"; then
+                echo "pushed on attempt $i"; break
+              fi
+              echo "push rejected (attempt $i), rebasing"
+              git pull --rebase origin main || true
+              sleep 3
+            done
+            if ! git rev-parse "origin/${BRANCH}" >/dev/null 2>&1; then
+              echo "::error::could not push ${BRANCH}"
+              exit 1
+            fi
+          fi
+
+          if [ -f "workspace/${PHASE}/.done" ]; then
+            echo "done=true" >> "$GITHUB_OUTPUT"
+            echo "BOT_DONE=true" >> "$GITHUB_ENV"
+          else
+            echo "done=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or update PR
+        id: pr
+        if: always() && steps.commit.outputs.done == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          PHASE="${{ needs.select-phase.outputs.phase }}"
+          BRANCH="${{ steps.meta.outputs.branch }}"
+          mkdir -p .github
+
+          BODY_FILE="$(mktemp)"
+          {
+            echo "Automated phase run by \`ops.yml\`."
+            echo
+            echo "- Phase: \`${PHASE}\`"
+            echo "- Prompt: \`workspace/${PHASE}/PROMPT.md\`"
+            echo "- Model: \`${OPENCODE_MODEL%%,*}\`"
+            echo "- Logs: \`logs/${PHASE}.log\`, \`logs/${PHASE}.verify.log\`"
+            echo
+            echo "Auto-merge is enabled. It lands only once \`analyze + test\`,"
+            echo "\`android\` and \`windows\` are green on this PR."
+          } > "$BODY_FILE"
+
+          EXISTING=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            gh pr edit "$EXISTING" --body-file "$BODY_FILE" >/dev/null 2>&1 || true
+            echo "pr=$EXISTING" >> "$GITHUB_OUTPUT"
+          else
+            gh pr create \
+              --head "$BRANCH" \
+              --base main \
+              --title "ops(${PHASE}): $(sed -n 's/^# //p' workspace/${PHASE}/PROMPT.md | head -1)" \
+              --body-file "$BODY_FILE" >/dev/null 2>&1 || true
+            NUM=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
+            echo "pr=$NUM" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ops-logs-${{ needs.select-phase.outputs.phase }}
+          path: logs/${{ needs.select-phase.outputs.phase }}*
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Report status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PHASE="${{ needs.select-phase.outputs.phase }}"
+          mkdir -p logs
+          if [ -f "workspace/${PHASE}/.done" ]; then
+            echo "::notice::phase ${PHASE} complete, PR opened"
+          elif [ -f "workspace/${PHASE}/.deferred" ]; then
+            echo "::notice::phase ${PHASE} deferred (rate limit), next tick retries"
+          elif [ -f "workspace/${PHASE}/.no_work" ]; then
+            echo "::warning::phase ${PHASE} produced no work"
+          elif [ -f "workspace/${PHASE}/.blocked" ]; then
+            echo "::error::phase ${PHASE} blocked after max attempts"
+            N=$(gh issue list --state open --search "ops blocked ${PHASE}" --json number --jq 'length' 2>/dev/null || echo 0)
+            if [ "$N" = "0" ]; then
+              B=$(mktemp)
+              {
+                echo "Phase **${PHASE}** hit the attempt cap and is now skipped by the pipeline."
+                echo
+                echo "## Log tail"
+                echo '```'
+                tail -80 "logs/${PHASE}.log" 2>/dev/null || echo "(no log)"
+                echo '```'
+                echo
+                echo "## Verify log tail"
+                echo '```'
+                tail -80 "logs/${PHASE}.verify.log" 2>/dev/null || echo "(none)"
+                echo '```'
+                echo
+                echo "Fix the cause, then delete \`workspace/${PHASE}/.blocked\` and \`workspace/${PHASE}/.attempts\` and push."
+              } > "$B"
+              gh issue create --title "ops blocked: ${PHASE}" --body-file "$B" >/dev/null 2>&1 || true
+            fi
+          else
+            echo "::warning::phase ${PHASE} did not complete"
+          fi
+
+  review:
+    name: review
+    needs: [select-phase, run-phase]
+    if: needs.select-phase.outputs.exists == 'true' && needs.run-phase.outputs.done == 'true' && inputs.review != false
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install opencode
+        run: |
+          set -euo pipefail
+          curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION"
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Review and fix
+        id: review
+        continue-on-error: true
+        run: |
+          chmod +x scripts/phase_runner.sh
+          git config user.name "pixelforge-bot"
+          git config user.email "pixelforge-bot@users.noreply.github.com"
+          git checkout -B "pf-bot/${{ needs.select-phase.outputs.phase }}"
+          set +e
+          bash scripts/phase_runner.sh "${{ needs.select-phase.outputs.phase }}" --review-only
+          echo "exit=$?"
+          exit 0
+
+      - name: Push review fixes
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          PHASE="${{ needs.select-phase.outputs.phase }}"
+          BRANCH="${{ steps.meta_branch.outputs.branch }}"
+          BRANCH="pf-bot/${PHASE}"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no review changes"
+            exit 0
+          fi
+          git commit -m "ops(${PHASE}): review fixes"
+          for i in 1 2 3 4 5; do
+            if git push -f origin "HEAD:refs/heads/${BRANCH}"; then
+              echo "review fixes pushed on attempt $i"; exit 0
+            fi
+            git pull --rebase origin main || true
+            sleep 3
+          done
+          echo "::error::could not push review fixes for ${PHASE}"
+
+  merge:
+    name: enable auto-merge
+    needs: [select-phase, run-phase]
+    if: needs.select-phase.outputs.exists == 'true' && needs.run-phase.outputs.pr != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.run-phase.outputs.pr }}
+        run: |
+          set -uo pipefail
+          [ -n "$PR" ] || { echo "no PR to merge"; exit 0; }
+
+          STATE=$(gh pr view "$PR" --json state --jq '.state' 2>/dev/null || echo "")
+          if [ "$STATE" != "OPEN" ]; then
+            echo "PR ${PR} is ${STATE}, nothing to do"
+            exit 0
+          fi
+
+          # --auto hands the merge to GitHub, which waits for the required
+          # status checks configured by .github/workflows/branch-protection.yml.
+          if gh pr merge "$PR" --squash --auto --delete-branch 2>/dev/null; then
+            echo "auto-merge enabled on PR ${PR}"
+          else
+            echo "::warning::--auto not accepted, falling back to --squash"
+            gh pr merge "$PR" --squash --delete-branch || true
+          fi
+
+  retrigger:
+    name: chain next phase
+    needs: [select-phase]
+    if: always() && needs.select-phase.outputs.exists == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PHASE: ${{ needs.select-phase.outputs.phase }}
+        run: |
+          set -uo pipefail
+          # 10s so a retrigger cannot tight-loop while the previous push is
+          # still in flight.
+          sleep 10
+          gh api -X POST -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/dispatches" \
+            -f "event_type=ops_tick" \
+            -f "client_payload[phase]=${PHASE}" \
+            -f "client_payload[run_id]=${{ github.run_id }}" \
+            || echo "::warning::re-dispatch failed, ops-tick cron will retry"

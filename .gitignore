@@ -52,3 +52,9 @@ android/key.properties
 
 # CI scratch output
 /perks-permissions.txt
+
+# ops loop: per-phase agent logs. Uploaded as CI artifacts, never committed.
+/logs/
+
+# ops loop: checkpoint branches live on the remote as pf-bot/wip/<phase>
+# and are never merged into main.

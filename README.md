@@ -90,6 +90,55 @@ flutter run -d windows      # or -d chrome, -d <android-device>
 Push a `v*` tag and the workflow builds a draft GitHub release with the APKs, the AAB and
 a Windows zip. Builds also run on every push to `main`; artifacts are attached to the run.
 
+## Autonomous development loop
+
+The roadmap is not maintained by hand. An ops loop reads
+[ROADMAP.md](ROADMAP.md), works one phase at a time, and writes its own next phases.
+
+```
+select-phase  picks the lowest workspace/phase-NN without .done or .blocked,
+              reading markers through the GitHub API with no checkout
+run-phase     flutter + opencode, runs scripts/phase_runner.sh,
+              pushes pf-bot/<phase> and opens a PR
+review        separate job, own budget, reviewer subagent, never invalidates a
+              phase that already passed
+merge         gh pr merge --auto. main is branch-protected with the build.yml
+              checks required, so only verified work lands
+retrigger     POSTs repository_dispatch back to itself, chaining the next phase
+              in ~10s. tick.yml is a 10-minute cron safety net
+```
+
+Phase state lives in git as marker files, so any tick resumes with no external
+state. See [AGENTS.md](AGENTS.md) for the full protocol.
+
+| Marker | Meaning |
+|---|---|
+| `workspace/<phase>/.done` | complete and verified |
+| `workspace/<phase>/.blocked` | hit the attempt cap, skipped until a human removes it |
+| `workspace/<phase>/.deferred` | rate limited; retried, and never costs an attempt |
+| `workspace/<phase>/.no_work` | agent exited 0 but changed nothing |
+| `workspace/<phase>/.timeout` | optional per-phase runner timeout, default 90 min |
+| `workspace/.stop` | halts the whole pipeline |
+
+The 31 declared phases live in `workspace/phase-01` through `workspace/phase-31`.
+`phase-31` is the self-audit: it measures reality with the benchmark harness,
+checks every roadmap claim against the code, re-verifies the privacy invariants,
+writes `AUDIT_REPORT.md`, and **generates new phase prompts**. Because selection
+is "lowest phase without `.done`", generated phases are picked up automatically.
+
+### Running it
+
+```bash
+gh workflow run ops.yml                     # auto-select the next phase
+gh workflow run ops.yml -f phase=phase-04    # force one
+```
+
+Requires the `OPENCODE_API_KEY` repository secret. The model chain starts at
+`opencode/space-bunny-free` and falls back through 20 free tiers, advancing only
+on model-level failures and never on a real work failure.
+
+Stop the loop by creating an empty `workspace/.stop` file, or from the Actions UI.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).

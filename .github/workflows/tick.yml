@@ -1,0 +1,59 @@
+name: ops-tick
+
+# Safety net. The primary chaining mechanism is ops.yml's retrigger job, which
+# POSTs repository_dispatch(ops_tick) after every run and picks the next phase up
+# within ~10-30s. GitHub cron is documented as "not guaranteed" and gets
+# throttled, so this is the backup path, not the primary one.
+
+on:
+  schedule:
+    - cron: '*/10'
+  workflow_dispatch:
+
+concurrency:
+  group: ops-tick
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tick:
+    name: re-dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fire ops_tick if the pipeline is idle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+
+          # Do not stack a tick on top of a run already in flight.
+          IN_PROGRESS=$(gh api -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/runs?status=in_progress&per_page=20" \
+            --jq '[.workflow_runs[] | select(.name == "ops")] | length' 2>/dev/null || echo 0)
+
+          if [ "${IN_PROGRESS:-0}" -gt 1 ]; then
+            echo "ops already running (${IN_PROGRESS} in-progress runs), skipping this tick"
+            exit 0
+          fi
+
+          # If nothing is left to do, do not keep the dispatcher alive.
+          REMAINING=$(gh api "repos/${GITHUB_REPOSITORY}/git/trees/HEAD?recursive=1" \
+            --jq '[.tree[].path | select(test("^workspace/phase-[0-9]+/\\.(done|blocked)$"))] | length' 2>/dev/null || echo 0)
+          TOTAL=$(gh api "repos/${GITHUB_REPOSITORY}/git/trees/HEAD?recursive=1" \
+            --jq '[.tree[].path | select(test("^workspace/phase-[0-9]+/PROMPT.md$"))] | length' 2>/dev/null || echo 0)
+
+          if [ "${REMAINING:-0}" -ge "${TOTAL:-1}" ] && [ "${TOTAL:-0}" -gt 0 ]; then
+            echo "all ${TOTAL} phases resolved (${REMAINING} done/blocked), nothing to dispatch"
+            exit 0
+          fi
+
+          echo "firing ops_tick (${REMAINING:-?} of ${TOTAL:-?} phases resolved)"
+          gh api -X POST -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/dispatches" \
+            -f "event_type=ops_tick" \
+            -f "client_payload[reason]=safety_net_cron" \
+            -f "client_payload[run_id]=${{ github.run_id }}" \
+            || echo "::warning::re-dispatch failed, will retry on the next tick"
