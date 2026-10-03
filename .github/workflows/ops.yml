@@ -548,6 +548,22 @@ jobs:
             exit 0
           fi
 
+          # Do not queue behind yourself. repository_dispatch creates a run
+          # unconditionally, so with cancel-in-progress false a slow phase plus
+          # the 10-minute cron accumulates queued runs faster than they drain,
+          # and the whole pipeline stalls on its own backlog.
+          QUEUED=$(gh api -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/runs?status=queued&per_page=20" \
+            --jq '[.workflow_runs[] | select(.name == "ops")] | length' 2>/dev/null || echo 0)
+          RUNNING=$(gh api -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/runs?status=in_progress&per_page=20" \
+            --jq '[.workflow_runs[] | select(.name == "ops")] | length' 2>/dev/null || echo 0)
+
+          if [ "${QUEUED:-0}" -gt 0 ] || [ "${RUNNING:-0}" -gt 0 ]; then
+            echo "another ops run is already ${RUNNING:-0} running / ${QUEUED:-0} queued, not re-dispatching"
+            exit 0
+          fi
+
           # 10s so a retrigger cannot tight-loop while the previous push is
           # still in flight.
           sleep 10
