@@ -81,6 +81,26 @@ jobs:
           grep -E '^workspace/phase-[0-9]+/' /tmp/tree.txt | cut -d/ -f2 | sort -V -u > /tmp/phase_names.txt
           [ -s /tmp/phase_names.txt ] || { echo "no phases declared"; echo "exists=false" >> "$GITHUB_OUTPUT"; exit 0; }
 
+          # Capability probe. A repo whose workflow token cannot create pull
+          # requests fails every phase silently at the very last step, after the
+          # agent has already burned its whole budget. One cheap call here turns
+          # that into an immediate, obvious error with the fix spelled out.
+          if ! gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls" \
+               -f title="pixelforge ops capability probe" \
+               -f head="${{ github.actor }}:ops-capability-probe" \
+               -f base=main -f body="probe" >/dev/null 2>&1; then
+            if gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls" \
+                 -f title="probe" -f head="probe" -f base=main -f body="probe" 2>&1 \
+                 | grep -q "not permitted to create or approve pull requests"; then
+              echo "::error::GITHUB_TOKEN cannot create pull requests. Enable it with:"
+              echo "::error::  gh api -X PUT repos/${GITHUB_REPOSITORY}/actions/permissions/workflow -F default_workflow_permissions=write -F can_approve_pull_request_reviews=true"
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          git push origin --delete "ops-capability-probe" >/dev/null 2>&1 || true
+          gh pr close --head "ops-capability-probe" >/dev/null 2>&1 || true
+
           while read -r name; do
             [ -n "$name" ] || continue
             for m in done blocked deferred attempts terminal; do
