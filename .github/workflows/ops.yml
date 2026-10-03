@@ -202,6 +202,8 @@ jobs:
           set -euo pipefail
           curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION"
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          # GITHUB_PATH only affects later steps, so this step needs its own PATH.
+          export PATH="$HOME/.opencode/bin:$PATH"
           opencode --version
 
       - name: Meta
@@ -351,6 +353,8 @@ jobs:
           set -euo pipefail
           curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION"
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.opencode/bin:$PATH"
+          opencode --version
 
       - name: Confirm main is green before reviewing
         env:
