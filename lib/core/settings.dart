@@ -26,6 +26,10 @@ enum OutputFormat {
   /// True when a quality slider is meaningful.
   bool get supportsQuality => this == jpeg || this == webp;
 
+  /// True when the container can carry more than one frame. Only these two
+  /// keep an animation; everything else is flattened and the caller is told.
+  bool get supportsFrames => this == gif || this == webp;
+
   static OutputFormat fromExtension(String? ext) {
     if (ext == null) return OutputFormat.keep;
     final e = ext.toLowerCase().replaceAll('.', '');
@@ -224,6 +228,7 @@ class ResizeSettings extends ChangeNotifier {
   bool _stripMetadata = true;
   bool _autoRotate = true;
   bool _progressive = true;
+  bool _preserveAnimation = true;
 
   // --- Transforms -------------------------------------------------------
   int _rotateQuarterTurns = 0;
@@ -278,6 +283,7 @@ class ResizeSettings extends ChangeNotifier {
   bool get stripMetadata => _stripMetadata;
   bool get autoRotate => _autoRotate;
   bool get progressive => _progressive;
+  bool get preserveAnimation => _preserveAnimation;
 
   int get rotateQuarterTurns => _rotateQuarterTurns;
   bool get flipH => _flipH;
@@ -438,6 +444,14 @@ class ResizeSettings extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// When off, an animated GIF or WebP is deliberately collapsed to its first
+  /// frame. Default on: flattening an animation is silent data loss.
+  void setPreserveAnimation(bool v) {
+    if (v == _preserveAnimation) return;
+    _preserveAnimation = v;
+    notifyListeners();
+  }
+
   void rotateBy(int quarterTurns) {
     _rotateQuarterTurns = (_rotateQuarterTurns + quarterTurns) % 4;
     notifyListeners();
@@ -582,6 +596,7 @@ class ResizeSettings extends ChangeNotifier {
     'strip': _stripMetadata,
     'autorot': _autoRotate,
     'prog': _progressive,
+    'anim': _preserveAnimation,
     'rot': _rotateQuarterTurns,
     'fh': _flipH,
     'fv': _flipV,
@@ -628,6 +643,7 @@ class ResizeSettings extends ChangeNotifier {
     _stripMetadata = (j['strip'] as bool?) ?? _stripMetadata;
     _autoRotate = (j['autorot'] as bool?) ?? _autoRotate;
     _progressive = (j['prog'] as bool?) ?? _progressive;
+    _preserveAnimation = (j['anim'] as bool?) ?? _preserveAnimation;
     _rotateQuarterTurns = ((j['rot'] as num?)?.toInt() ?? 0) % 4;
     _flipH = (j['fh'] as bool?) ?? _flipH;
     _flipV = (j['fv'] as bool?) ?? _flipV;
@@ -667,6 +683,7 @@ class ResizeSettings extends ChangeNotifier {
     _stripMetadata = true;
     _autoRotate = true;
     _progressive = true;
+    _preserveAnimation = true;
     _rotateQuarterTurns = 0;
     _flipH = false;
     _flipV = false;

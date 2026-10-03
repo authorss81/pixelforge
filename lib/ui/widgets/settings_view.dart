@@ -25,6 +25,8 @@ class SettingsView extends StatelessWidget {
             const SectionLabel('Size'),
             _size(context, s),
             _outputFormat(s),
+            if (s.format.supportsFrames || s.format == OutputFormat.keep)
+              _animation(context, s),
             if (s.format.supportsQuality || s.format == OutputFormat.keep)
               _quality(context, s),
             if (s.format == OutputFormat.png) _pngLevel(s),
@@ -233,6 +235,24 @@ class SettingsView extends StatelessWidget {
           onSelectionChanged: (sel) => s.setFormat(sel.first),
         ),
       ],
+    );
+  }
+
+  Widget _animation(BuildContext context, ResizeSettings s) {
+    return SwitchListTile(
+      contentPadding: EdgeInsets.zero,
+      dense: true,
+      value: s.preserveAnimation,
+      onChanged: s.setPreserveAnimation,
+      title: const Text('Preserve animation', style: TextStyle(fontSize: 13.5)),
+      subtitle: Text(
+        'Every frame of an animated GIF or WebP is carried through. '
+        'Turning it off flattens to the first frame.',
+        style: TextStyle(
+          fontSize: 11,
+          color: Theme.of(context).colorScheme.onSurfaceVariant,
+        ),
+      ),
     );
   }
 

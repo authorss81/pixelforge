@@ -252,13 +252,36 @@ class _StatusLine extends StatelessWidget {
         '${job.sourceSizeLabel} -> ${job.outputSizeLabel}',
         formatBytes(job.outputBytes),
         if (q != null) 'q$q',
+        if (job.outFrames > 1) '${job.outFrames} frames',
         if (saved != null && saved > 0) '-${(saved * 100).round()}%',
       ];
-      return Text(
-        parts.join('  ·  '),
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: theme.textTheme.bodySmall?.copyWith(color: muted, fontSize: 11),
+      final notice = job.notice;
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            parts.join('  ·  '),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: muted,
+              fontSize: 11,
+            ),
+          ),
+          if (notice != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                notice,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.tertiary,
+                  fontSize: 10.5,
+                ),
+              ),
+            ),
+        ],
       );
     }
 

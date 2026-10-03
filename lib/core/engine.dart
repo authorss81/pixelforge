@@ -16,6 +16,8 @@ class EngineResult {
     required this.extension,
     this.quality,
     this.metTarget = true,
+    this.frames = 1,
+    this.notice,
   });
 
   final Uint8List bytes;
@@ -26,6 +28,13 @@ class EngineResult {
 
   /// False when the requested byte budget could not be met at minimum quality.
   final bool metTarget;
+
+  /// How many frames the encoded result actually holds.
+  final int frames;
+
+  /// Set when the output could not carry everything the source had. A user who
+  /// loses frames without being told is worse served than one who gets told.
+  final String? notice;
 }
 
 class EngineError implements Exception {
@@ -47,6 +56,30 @@ class SourceInfo {
 }
 
 const List<num> _sharpenKernel = [0, -1, 0, -1, 5, -1, 0, -1, 0];
+
+/// Geometry resolved once per source image and reused for every frame, so an
+/// animation keeps a uniform frame size instead of drifting with whatever
+/// aspect ratio a later frame happens to carry.
+class _FrameGeometry {
+  const _FrameGeometry({
+    required this.outer,
+    required this.target,
+    required this.crop,
+    required this.interpolation,
+  });
+
+  /// The canvas a padded result is stretched out to. Equal to [target]
+  /// whenever the mode does not pad.
+  final TargetSize outer;
+
+  /// The size every frame is resized to.
+  final TargetSize target;
+
+  /// The source-pixel rectangle removed before resizing, when cropping.
+  final CropPlan crop;
+
+  final img.Interpolation interpolation;
+}
 
 const List<String> supportedInputExtensions = <String>[
   'jpg',
@@ -142,7 +175,88 @@ class ResizeEngine {
 
     tick(0.10);
 
-    var work = decoded;
+    final outFormat = _resolveFormat(
+      s.format,
+      s.keepExtensionWhenKeepFormat,
+      name == null ? null : extensionOfName(name),
+    );
+
+    // Orientation, rotation and flips act on the whole animation, so they run
+    // once over every frame at once instead of inside the per-frame transform.
+    final oriented = _applySourceTransforms(decoded, s);
+
+    tick(0.22);
+
+    // Frames only survive when the user has not opted out and the chosen
+    // container can actually hold them.
+    final animated =
+        s.preserveAnimation && decoded.hasAnimation && outFormat.supportsFrames;
+    final inputs = animated
+        ? oriented.frames.map(_detachFrame).toList()
+        : <img.Image>[_detachFrame(oriented.frames.first)];
+
+    // Geometry comes from frame 0 once, so every frame lands on identical
+    // dimensions instead of drifting with each frame's own aspect ratio.
+    final geometry = _geometryFor(s.spec, inputs.first);
+
+    final total = inputs.length;
+    final produced = <img.Image>[];
+    for (var i = 0; i < total; i++) {
+      final out = _applyToFrame(inputs[i], s, geometry, outFormat);
+      out.frameDuration = inputs[i].frameDuration;
+      produced.add(out);
+      tick(0.22 + (0.80 - 0.22) * (i + 1) / total);
+    }
+
+    if (s.stripMetadata) {
+      for (final f in produced) {
+        f.exif = img.ExifData();
+      }
+    }
+
+    final work = _assemble(produced, loopCount: oriented.loopCount);
+    final notice = _animationNotice(
+      sourceFrames: decoded.numFrames,
+      animated: animated,
+      outFormat: outFormat,
+      preserveAnimation: s.preserveAnimation,
+    );
+
+    final budget = s.targetKb == null ? null : s.targetKb! * 1024;
+    if (budget != null && outFormat.supportsQuality) {
+      final solved = _solveToBudget(
+        work,
+        outFormat,
+        s,
+        budget,
+        animated: animated,
+        notice: notice,
+      );
+      tick(1.0);
+      return solved;
+    }
+
+    final encoded = _encode(work, outFormat, s, animated: animated);
+    tick(1.0);
+
+    return EngineResult(
+      bytes: encoded,
+      width: work.width,
+      height: work.height,
+      extension: outFormat.extension!,
+      quality: outFormat.supportsQuality ? s.quality : null,
+      frames: animated ? total : 1,
+      notice: notice,
+    );
+  }
+
+  // ------------------------------------------------------------- animations
+  /// Rotation and flipping are source-level: they must move every frame
+  /// together or the animation tears. `bakeOrientation` and `copyRotate`
+  /// already walk `frames`, and `flipHorizontal`/`flipVertical` edit them in
+  /// place.
+  static img.Image _applySourceTransforms(img.Image src, ResizeSettings s) {
+    var work = src;
 
     // Orientation is always baked when metadata is being dropped, otherwise the
     // stripped orientation tag would leave the pixels sideways.
@@ -157,100 +271,151 @@ class ResizeEngine {
     if (s.flipH) work = img.flipHorizontal(work);
     if (s.flipV) work = img.flipVertical(work);
 
-    tick(0.22);
+    return work;
+  }
 
-    final outFormat = _resolveFormat(
-      s.format,
-      s.keepExtensionWhenKeepFormat,
-      name == null ? null : extensionOfName(name),
-    );
-    final spec = s.spec;
-
+  /// Resolves the shared geometry for every frame of one source image.
+  ///
+  /// Crop and pad are expressed against frame 0's pixel grid and the resampling
+  /// method is chosen from the post-crop dimensions, which is what the
+  /// single-frame path did.
+  static _FrameGeometry _geometryFor(ResizeSpec spec, img.Image source) {
     // exactFit scales to sit inside the box and then pads out to it, so it needs
     // two sizes: the scaled inner rect and the outer canvas.
-    final outer = computeTargetSize(spec, work.width, work.height);
-    var target = spec.mode == ResizeMode.exactFit
+    final outer = computeTargetSize(spec, source.width, source.height);
+    final target = spec.mode == ResizeMode.exactFit
         ? computeFitInsideBox(
-            work.width,
-            work.height,
+            source.width,
+            source.height,
             outer.width,
             outer.height,
             allowUpscale: spec.allowUpscale,
           )
         : outer;
 
+    var crop = CropPlan.none;
+    var srcW = source.width;
+    var srcH = source.height;
     if (spec.mode == ResizeMode.exactCrop) {
-      final plan = computeCropPlan(work.width, work.height, target);
+      final plan = computeCropPlan(srcW, srcH, target);
       if (plan != CropPlan.none) {
-        work = img.copyCrop(
-          work,
-          x: plan.cropX,
-          y: plan.cropY,
-          width: plan.cropW,
-          height: plan.cropH,
-        );
+        crop = plan;
+        srcW = plan.cropW;
+        srcH = plan.cropH;
       }
     }
 
-    if (work.width != target.width || work.height != target.height) {
-      final resample = defaultResample(
-        math.max(work.width, work.height),
-        math.max(target.width, target.height),
-      );
-      work = img.copyResize(
+    final resample = defaultResample(
+      math.max(srcW, srcH),
+      math.max(target.width, target.height),
+    );
+
+    return _FrameGeometry(
+      outer: outer,
+      target: target,
+      crop: crop,
+      interpolation: switch (resample) {
+        Resample.high => img.Interpolation.cubic,
+        Resample.balanced => img.Interpolation.average,
+        Resample.fast => img.Interpolation.linear,
+      },
+    );
+  }
+
+  /// Frame zero of a decoded animation *is* the animation: `frames` hangs the
+  /// whole sequence off it. Every transform in the pipeline walks `frames`, so a
+  /// frame has to be handed over detached or transforming frame 0 would quietly
+  /// re-process every other frame as well.
+  static img.Image _detachFrame(img.Image frame) =>
+      frame.numFrames == 1 ? frame : img.Image.from(frame, noAnimation: true);
+
+  /// One frame through the whole pipeline.
+  ///
+  /// [geometry] is shared by every frame of a source so an animation cannot
+  /// drift out of alignment frame by frame.
+  static img.Image _applyToFrame(
+    img.Image frame,
+    ResizeSettings s,
+    _FrameGeometry geometry,
+    OutputFormat outFormat,
+  ) {
+    var work = frame;
+
+    if (geometry.crop != CropPlan.none) {
+      work = img.copyCrop(
         work,
-        width: target.width,
-        height: target.height,
-        interpolation: switch (resample) {
-          Resample.high => img.Interpolation.cubic,
-          Resample.balanced => img.Interpolation.average,
-          Resample.fast => img.Interpolation.linear,
-        },
+        x: geometry.crop.cropX,
+        y: geometry.crop.cropY,
+        width: geometry.crop.cropW,
+        height: geometry.crop.cropH,
       );
     }
 
-    tick(0.45);
+    if (work.width != geometry.target.width ||
+        work.height != geometry.target.height) {
+      work = img.copyResize(
+        work,
+        width: geometry.target.width,
+        height: geometry.target.height,
+        interpolation: geometry.interpolation,
+      );
+    }
 
     work = _applyAdjustments(work, s);
     work = _applyFilters(work, s);
 
-    tick(0.62);
-
-    if (spec.mode == ResizeMode.exactFit) {
-      work = _pad(work, outer, toCodecColor(s.padColor));
+    if (s.spec.mode == ResizeMode.exactFit) {
+      work = _pad(work, geometry.outer, toCodecColor(s.padColor));
     }
 
     if (s.watermark.active) {
       work = _applyWatermark(work, s.watermark);
     }
 
-    tick(0.72);
+    return _prepareChannels(work, outFormat);
+  }
 
-    work = _prepareChannels(work, outFormat);
-
-    if (s.stripMetadata) {
-      work.exif = img.ExifData();
+  /// Rebuilds an animation from already-transformed frames, keeping the source
+  /// loop count so the result still repeats the way the input did.
+  static img.Image _assemble(List<img.Image> frames, {required int loopCount}) {
+    final head = frames.first;
+    for (var i = 1; i < frames.length; i++) {
+      head.addFrame(frames[i]);
     }
+    head.loopCount = loopCount;
+    return head;
+  }
 
-    tick(0.80);
-
-    final budget = s.targetKb == null ? null : s.targetKb! * 1024;
-    if (budget != null && outFormat.supportsQuality) {
-      final solved = _solveToBudget(work, outFormat, s, budget);
-      tick(1.0);
-      return solved;
+  /// Explains, rather than hides, the two ways an animation can be lost.
+  static String? _animationNotice({
+    required int sourceFrames,
+    required bool animated,
+    required OutputFormat outFormat,
+    required bool preserveAnimation,
+  }) {
+    if (sourceFrames < 2 || animated) return null;
+    // The only way to reach here with a frame-capable container is the opt-out,
+    // because [animated] folds [preserveAnimation] in.
+    if (outFormat.supportsFrames && !preserveAnimation) {
+      return 'Animation flattened to one frame: "Preserve animation" is off.';
     }
+    return 'Animation flattened to one frame: ${outFormat.label} cannot hold '
+        'more than one frame.';
+  }
 
-    final encoded = _encode(work, outFormat, s);
-    tick(1.0);
-
-    return EngineResult(
-      bytes: encoded,
-      width: work.width,
-      height: work.height,
-      extension: outFormat.extension!,
-      quality: outFormat.supportsQuality ? s.quality : null,
-    );
+  /// libwebp's demuxer rejects the whole file when a frame overruns the canvas,
+  /// so the failure is raised as a real message rather than an opaque encoder
+  /// exception reported as "Unexpected error".
+  static void _assertFramesFitCanvas(img.Image im) {
+    for (var i = 0; i < im.numFrames; i++) {
+      final f = im.frames[i];
+      if (f.width > im.width || f.height > im.height) {
+        throw EngineError(
+          'Frame $i of this animation is ${f.width}x${f.height} and does not '
+          'fit the ${im.width}x${im.height} canvas WebP requires.',
+        );
+      }
+    }
   }
 
   // ------------------------------------------------------------------ output
@@ -483,11 +648,14 @@ class ResizeEngine {
   }
 
   // ---------------------------------------------------------------- encoding
+  /// [animated] must be true whenever [im] holds more than one frame, otherwise
+  /// the encoder is told to write a still and silently drops the rest.
   static Uint8List _encode(
     img.Image im,
     OutputFormat fmt,
     ResizeSettings s, {
     int? quality,
+    bool animated = false,
   }) {
     final q = quality ?? s.quality;
     switch (fmt) {
@@ -502,14 +670,18 @@ class ResizeEngine {
       case OutputFormat.png:
         return img.encodePng(im, level: s.pngLevel);
       case OutputFormat.webp:
+        if (animated) _assertFramesFitCanvas(im);
         return img.encodeWebP(
           im,
+          // lossless is on by default in the codec, and it makes quality and
+          // method do nothing, so it has to be turned off deliberately.
           lossless: s.webpLossless,
           quality: s.webpLossless ? 100 : q,
           method: s.webpMethod,
+          singleFrame: !animated,
         );
       case OutputFormat.gif:
-        return img.encodeGif(im, singleFrame: true);
+        return img.encodeGif(im, singleFrame: !animated);
       case OutputFormat.tiff:
         return img.encodeTiff(im, singleFrame: true);
       case OutputFormat.bmp:
@@ -524,12 +696,15 @@ class ResizeEngine {
     img.Image im,
     OutputFormat fmt,
     ResizeSettings s,
-    int budgetBytes,
-  ) {
+    int budgetBytes, {
+    required bool animated,
+    String? notice,
+  }) {
     final minQ = fmt == OutputFormat.jpeg ? 25 : 10;
     final maxQ = fmt == OutputFormat.jpeg ? 96 : 92;
+    final frameCount = animated ? im.numFrames : 1;
 
-    final atMax = _encode(im, fmt, s, quality: maxQ);
+    final atMax = _encode(im, fmt, s, quality: maxQ, animated: animated);
     if (atMax.length <= budgetBytes) {
       return EngineResult(
         bytes: atMax,
@@ -537,10 +712,12 @@ class ResizeEngine {
         height: im.height,
         extension: fmt.extension!,
         quality: maxQ,
+        frames: frameCount,
+        notice: notice,
       );
     }
 
-    final atMin = _encode(im, fmt, s, quality: minQ);
+    final atMin = _encode(im, fmt, s, quality: minQ, animated: animated);
     if (atMin.length > budgetBytes) {
       return EngineResult(
         bytes: atMin,
@@ -549,6 +726,8 @@ class ResizeEngine {
         extension: fmt.extension!,
         quality: minQ,
         metTarget: false,
+        frames: frameCount,
+        notice: notice,
       );
     }
 
@@ -557,7 +736,7 @@ class ResizeEngine {
     var bestQ = minQ;
     while (lo <= hi) {
       final mid = (lo + hi) ~/ 2;
-      final size = _encode(im, fmt, s, quality: mid).length;
+      final size = _encode(im, fmt, s, quality: mid, animated: animated).length;
       if (size <= budgetBytes) {
         bestQ = mid;
         lo = mid + 1;
@@ -567,11 +746,13 @@ class ResizeEngine {
     }
 
     return EngineResult(
-      bytes: _encode(im, fmt, s, quality: bestQ),
+      bytes: _encode(im, fmt, s, quality: bestQ, animated: animated),
       width: im.width,
       height: im.height,
       extension: fmt.extension!,
       quality: bestQ,
+      frames: frameCount,
+      notice: notice,
     );
   }
 
@@ -614,6 +795,8 @@ Future<void> processJob(ImageJob job, ResizeSettings settings) async {
       width: res.width,
       height: res.height,
       quality: res.quality,
+      frames: res.frames,
+      notice: res.notice,
     );
   } on EngineError catch (e) {
     job.markFailed(e.message);
