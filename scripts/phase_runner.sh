@@ -12,7 +12,6 @@
 #   .attempts        integer count of real work attempts
 #   .deferred_attempts  integer count of deferrals
 #   .no_work         agent exited 0 but changed nothing that mattered
-#   .session         opencode session id for continuity
 #   .timeout         optional per-phase runner timeout in minutes, default 90
 #
 # workspace/.stop halts the whole pipeline.
@@ -45,7 +44,6 @@ ATTEMPTS_FILE="${PHASE_DIR}/.attempts"
 DEFERRED_FILE="${PHASE_DIR}/.deferred"
 DEFERRED_ATTEMPTS_FILE="${PHASE_DIR}/.deferred_attempts"
 NO_WORK_FILE="${PHASE_DIR}/.no_work"
-SESSION_FILE="${PHASE_DIR}/.session"
 ENV_BLOCKED_FILE="${PHASE_DIR}/.env_blocked"
 PROMPT_FILE="${PHASE_DIR}/PROMPT.md"
 STOP_FILE="workspace/.stop"
@@ -111,15 +109,26 @@ read_attempts() {
 # ---------------------------------------------------------------------------
 # rate limit / model classification
 # ---------------------------------------------------------------------------
+# Rate-limit classification is only meaningful when the model actually failed.
+#
+# It must never be applied after a success. opencode's log contains the agent's
+# own prose, and an agent that writes a report mentioning rate limits, 429s or
+# "overloaded" will trip any naive grep over the whole file. That is not a
+# failure, it is the agent doing its job, and treating it as one defers a phase
+# that already succeeded.
 log_is_rate_limited() {
-  grep -qiE "HTTP[ /]?429|429[^0-9]|too many requests|rate[ _-]?limit|insufficient[ _-]?quota|quota exceeded|overloaded|temporarily unavailable|connection reset|ETIMEDOUT|ENOTFOUND|socket hang up" \
-    "$1" 2>/dev/null && return 0
+  # Only look at the tail, where the transport error would be. A report is long;
+  # the failure is the last thing that happened.
+  tail -c 20000 "$1" 2>/dev/null \
+    | grep -qiE "HTTP[ /]?429|429[^0-9]|too many requests|insufficient[ _-]?quota|quota exceeded|rate[ _-]?limit[ _-]?exceeded|provider overloaded|temporarily unavailable|socket hang up|ETIMEDOUT|ECONNRESET" \
+    && return 0
   return 1
 }
 
 log_is_model_error() {
-  grep -qiE "model not found|unknown model|invalid model|no such model|provider not found|502|503|504|streaming response failed" \
-    "$1" 2>/dev/null && return 0
+  tail -c 20000 "$1" 2>/dev/null \
+    | grep -qiE "model not found|unknown model|invalid model|no such model|provider not found|^502|503|504|streaming response failed" \
+    && return 0
   return 1
 }
 
@@ -272,14 +281,6 @@ run_models() {
   return 1
 }
 
-capture_session() {
-  local sid
-  sid="$(opencode session list 2>/dev/null | tail -1 | awk '{print $2}' || true)"
-  if [ -n "$sid" ]; then
-    echo "$sid" > "$SESSION_FILE"
-    log "session captured: $sid"
-  fi
-}
 
 # ---------------------------------------------------------------------------
 # phase run
@@ -321,20 +322,12 @@ run_phase() {
 
   if [ -n "$ACTIVE_MODEL" ]; then
     log "model used: $ACTIVE_MODEL"
-    capture_session
+
   fi
 
-  # opencode stores sessions on local disk, which the runner wipes between runs.
-  # A committed .session marker then points at an id that no longer exists.
-  if [ "$code" -ne 0 ] && grep -qi "session not found" "${LOG_DIR}/${PHASE}.log" 2>/dev/null; then
-    warn "stale session marker, clearing it so the next tick starts fresh"
-    rm -f "$SESSION_FILE"
-    echo "$(( $(read_attempts "$ATTEMPTS_FILE") - 1 ))" > "$ATTEMPTS_FILE"
-    return 5
-  fi
 
-  if log_is_rate_limited "${LOG_DIR}/${PHASE}.log"; then
-    warn "rate limited, deferring without burning an attempt"
+  if log_is_rate_limited "${LOG_DIR}/${PHASE}.log" && ! tree_has_real_work; then
+    warn "rate limited with no work produced, deferring without burning an attempt"
     touch "$DEFERRED_FILE"
     local d
     d=$(( $(read_attempts "$DEFERRED_ATTEMPTS_FILE") + 1 ))
