@@ -17,7 +17,13 @@ Touching anything outside this list needs a justification in your notes.
 
 - `lib/core/engine.dart`
 - `lib/core/settings.dart`
+- `lib/ui/widgets/settings_view.dart`
 - `test/resize_test.dart`
+
+Note: an earlier run of this phase correctly implemented the engine and settings
+work but had no UI switch for `preserveAnimation`, because the file list omitted
+`lib/ui/widgets/settings_view.dart`. It is now included. The engine work from that
+run was sound and is on `pf-bot/wip/phase-01` if you want to compare approaches.
 
 ## Approach
 

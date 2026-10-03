@@ -50,3 +50,9 @@ Rejection is a behaviour change. Someone whose 16-bit TIFFs currently 'work' wil
 
 Color management with ICC profiles, CMYK output, or 32-bit float TIFF.
 
+Also out of scope, but noted by the phase-01 agent and left for a later phase:
+TIFF output still passes `singleFrame: true` in `_encode`, so an animated source
+converted to TIFF still loses frames. Phase 01 added `EngineResult.droppedFrames`
+so the loss is reported rather than silent, which satisfies the "never degrade
+silently" rule, but the underlying behaviour is unfixed. Fix it here.
+

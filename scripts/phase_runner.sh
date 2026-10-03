@@ -74,20 +74,33 @@ marker_paths() {
   echo "logs/|workspace/\.|^workspace/[^/]+/\.|\.log$|wip/|pf-bot/"
 }
 
-# Does the working tree contain changes a phase could plausibly have made?
+# Does this phase have real work?
+#
+# Both halves matter. The checkpoint loop commits to the phase branch every
+# CHECKPOINT_SECONDS, so by the time we ask, the working tree is usually clean
+# and the changes are in HEAD. Comparing against HEAD alone would then report
+# "no work" for a phase that did a large amount of it, and mark it .no_work.
+# PHASE_BASE is captured before the agent starts, so the committed diff is
+# measured across the whole phase regardless of checkpoint timing.
 tree_has_real_work() {
-  local changed
-  changed="$(git status --porcelain \
-    | grep -Ev "$(marker_paths)" \
-    | grep -Ev '^\?\? logs/' || true)"
-  [ -n "$changed" ]
+  local st committed
+  st="$(git status --porcelain | grep -Ev "$(marker_paths)" | grep -Ev '^\?\? logs/' || true)"
+  [ -n "$st" ] && return 0
+  if [ -n "${PHASE_BASE:-}" ]; then
+    committed="$(git diff --name-only "$PHASE_BASE" HEAD 2>/dev/null | grep -Ev "$(marker_paths)" || true)"
+    [ -n "$committed" ] && return 0
+  fi
+  return 1
 }
 
-tree_diff_has_real_work() {
-  local changed
-  changed="$(git diff --name-only HEAD \
-    | grep -Ev "$(marker_paths)" || true)"
-  [ -n "$changed" ]
+# Files the phase actually touched, for the log.
+phase_touched_files() {
+  {
+    git status --porcelain | grep -Ev "$(marker_paths)" | grep -Ev '^\?\? logs/' || true
+    if [ -n "${PHASE_BASE:-}" ]; then
+      git diff --name-only "$PHASE_BASE" HEAD 2>/dev/null | grep -Ev "$(marker_paths)" || true
+    fi
+  } | sed 's/^...//' | sort -u
 }
 
 read_attempts() {
@@ -148,8 +161,6 @@ preflight() {
 # checkpoint loop: commit WIP so a timeout cannot destroy work
 # ---------------------------------------------------------------------------
 checkpoint_loop() {
-  local local_branch
-  local_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
   while true; do
     sleep "$CHECKPOINT_SECONDS"
     if tree_has_real_work; then
@@ -157,7 +168,7 @@ checkpoint_loop() {
       if ! git diff --cached --quiet 2>/dev/null; then
         git commit -q -m "wip(${PHASE}): checkpoint" >/dev/null 2>&1 || true
         git push -q -f origin "HEAD:refs/heads/${WIP_BRANCH_PREFIX}/${PHASE}" >/dev/null 2>&1 || true
-        log "checkpoint committed and pushed (was on ${local_branch})"
+        log "checkpoint committed and pushed to ${WIP_BRANCH_PREFIX}/${PHASE}"
       fi
     fi
   done
@@ -289,6 +300,10 @@ run_phase() {
   rm -f "$DEFERRED_FILE" "$NO_WORK_FILE"
   log "attempt ${attempt} of ${MAX_ATTEMPTS}"
 
+  # Baseline for work detection. Must be captured before the agent runs,
+  # otherwise a checkpoint commit looks like the starting point.
+  PHASE_BASE="$(git rev-parse HEAD)"
+
   build_context_header
 
   checkpoint_loop &
@@ -331,6 +346,7 @@ run_phase() {
   if [ "$code" -ne 0 ]; then
     if tree_has_real_work; then
       warn "agent failed but left work in the tree, preserving it for the reviewer"
+      phase_touched_files | sed 's/^/  touched: /'
       return 1
     fi
     warn "agent failed with no changes"
@@ -338,15 +354,18 @@ run_phase() {
   fi
 
   # Exit 0 is not success if nothing changed.
-  if ! tree_has_real_work && ! tree_diff_has_real_work; then
+  if ! tree_has_real_work; then
     warn "agent exited 0 but changed nothing relevant"
     touch "$NO_WORK_FILE"
     return 2
   fi
 
-  log "work present, verifying"
+  log "work present, touching:"
+  phase_touched_files | sed 's/^/  /'
+
+  log "verifying"
   if ! verify; then
-    warn "verification failed"
+    warn "verification failed, leaving the work in place for the next attempt"
     return 1
   fi
 
