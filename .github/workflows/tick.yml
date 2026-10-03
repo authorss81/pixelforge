@@ -7,7 +7,10 @@ name: ops-tick
 
 on:
   schedule:
-    - cron: '*/10'
+    # Explicit minute list rather than */10. GitHub's cron validator rejects
+    # the step syntax, and an unparseable schedule means this safety net never
+    # runs at all, which is the one failure mode that must not happen.
+    - cron: '3,13,23,33,43,53 * * * *'
   workflow_dispatch:
 
 concurrency:

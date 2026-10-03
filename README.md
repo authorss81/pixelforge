@@ -139,6 +139,17 @@ on model-level failures and never on a real work failure.
 
 Stop the loop by creating an empty `workspace/.stop` file, or from the Actions UI.
 
+### Branch protection
+
+`main` requires `analyze + test`, `android` and `windows` to be green, which is
+what makes `gh pr merge --auto` wait instead of merging unverified work. This is
+a script rather than a workflow, because a workflow's token cannot request the
+`administration` scope:
+
+```bash
+bash scripts/apply-branch-protection.sh authorss81/pixelforge
+```
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).

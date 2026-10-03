@@ -46,6 +46,7 @@ DEFERRED_FILE="${PHASE_DIR}/.deferred"
 DEFERRED_ATTEMPTS_FILE="${PHASE_DIR}/.deferred_attempts"
 NO_WORK_FILE="${PHASE_DIR}/.no_work"
 SESSION_FILE="${PHASE_DIR}/.session"
+ENV_BLOCKED_FILE="${PHASE_DIR}/.env_blocked"
 PROMPT_FILE="${PHASE_DIR}/PROMPT.md"
 STOP_FILE="workspace/.stop"
 
@@ -119,18 +120,24 @@ preflight() {
   if [ ! -d "$PHASE_DIR" ]; then die "no such phase dir: $PHASE_DIR"; fi
   if [ ! -f "$PROMPT_FILE" ]; then die "missing prompt: $PROMPT_FILE"; fi
 
+  local reason=""
   if ! command -v opencode >/dev/null 2>&1; then
-    warn "opencode binary not on PATH"
+    reason="opencode binary not on PATH"
+  elif [ -z "${OPENCODE_API_KEY:-}" ]; then
+    reason="OPENCODE_API_KEY not set"
+  elif ! opencode models >/dev/null 2>&1; then
+    reason="opencode models failed, credentials or network problem"
+  fi
+
+  if [ -n "$reason" ]; then
+    warn "preflight failed: $reason"
+    # Environment is not ready, not the phase. Record it so the dispatcher
+    # stops self-retriggering in a tight loop and falls back to the cron
+    # cadence, which is the right retry rate for "the key was just added".
+    echo "$reason" > "$ENV_BLOCKED_FILE"
     return 1
   fi
-  if [ -z "${OPENCODE_API_KEY:-}" ]; then
-    warn "OPENCODE_API_KEY not set"
-    return 1
-  fi
-  if ! opencode models >/dev/null 2>&1; then
-    warn "opencode models failed, credentials or network problem"
-    return 1
-  fi
+  rm -f "$ENV_BLOCKED_FILE"
 
   git config user.name "pixelforge-bot" >/dev/null 2>&1 || true
   git config user.email "pixelforge-bot@users.noreply.github.com" >/dev/null 2>&1 || true
@@ -424,7 +431,10 @@ main() {
     return $?
   fi
 
-  preflight || return 5
+  if ! preflight; then
+    log "environment not ready, exiting without burning an attempt"
+    return 5
+  fi
 
   if [ -f "$STOP_FILE" ]; then
     log "workspace/.stop present, pipeline halted"

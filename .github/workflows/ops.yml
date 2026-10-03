@@ -283,6 +283,8 @@ jobs:
             echo "::notice::phase ${PHASE} complete, PR opened"
           elif [ -f "workspace/${PHASE}/.deferred" ]; then
             echo "::notice::phase ${PHASE} deferred (rate limit), next tick retries"
+          elif [ -f "workspace/${PHASE}/.env_blocked" ]; then
+            echo "::warning::environment not ready: $(cat workspace/${PHASE}/.env_blocked 2>/dev/null)"
           elif [ -f "workspace/${PHASE}/.no_work" ]; then
             echo "::warning::phase ${PHASE} produced no work"
           elif [ -f "workspace/${PHASE}/.blocked" ]; then
@@ -412,6 +414,18 @@ jobs:
           PHASE: ${{ needs.select-phase.outputs.phase }}
         run: |
           set -uo pipefail
+
+          # If the environment was not ready (missing OPENCODE_API_KEY, opencode
+          # not installed, network down) the phase made no progress and
+          # re-dispatching would tight-loop every 10 seconds. Leave it to the
+          # tick.yml cron, which retries on a sane cadence.
+          if gh api "repos/${GITHUB_REPOSITORY}/contents/workspace/${PHASE}/.env_blocked" >/dev/null 2>&1; then
+            echo "environment was not ready, not re-dispatching. ops-tick will retry."
+            gh api "repos/${GITHUB_REPOSITORY}/contents/workspace/${PHASE}/.env_blocked" \
+              --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | sed 's/^/  reason: /' || true
+            exit 0
+          fi
+
           # 10s so a retrigger cannot tight-loop while the previous push is
           # still in flight.
           sleep 10
