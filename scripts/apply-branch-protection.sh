@@ -16,6 +16,12 @@
 #
 # The contexts below are the job names of .github/workflows/build.yml. If you
 # rename a job there, rename it here too or auto-merge will merge without it.
+#
+# "strict" is deliberately false. Under strict mode the branch must contain the
+# current main before it can merge, and the bot never merges main into its own
+# branch, so any commit landing on main during a phase deadlocks the PR forever.
+# Required checks still validate the integration because a pull_request event
+# checks out the merge ref of PR plus main.
 
 set -euo pipefail
 
@@ -27,7 +33,7 @@ fi
 
 echo "applying branch protection to ${REPO}/main"
 echo "  required checks : analyze + test, android, windows"
-echo "  strict          : yes (branch must be up to date before merging)"
+echo "  strict          : no (strict deadlocks auto-merge on a lagging branch)"
 echo "  merge method    : squash only"
 echo
 
@@ -37,7 +43,7 @@ gh api -X PUT "repos/${REPO}/branches/main/protection" \
   -d '{
     "branch": "main",
     "required_status_checks": {
-      "strict": true,
+      "strict": false,
       "contexts": ["analyze + test", "android", "windows"]
     },
     "enforce_admins": false,

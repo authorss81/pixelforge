@@ -503,24 +503,40 @@ jobs:
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           PR: ${{ needs.run-phase.outputs.pr }}
         run: |
           set -uo pipefail
           [ -n "$PR" ] || { echo "no PR to merge"; exit 0; }
 
-          STATE=$(gh pr view "$PR" --json state --jq '.state' 2>/dev/null || echo "")
+          # This job has no checkout, so gh has no repository context and every
+          # call must name the repo. Without --repo, `gh pr view` fails outside
+          # a git work tree, returns an empty string, and the job prints
+          # "PR 1 is , nothing to do" while silently skipping the merge. That
+          # is exactly what happened.
+          if ! STATE=$(gh pr view "$PR" --repo "$GH_REPO" --json state --jq '.state' 2>&1); then
+            echo "::error::could not read PR ${PR}: ${STATE}"
+            exit 1
+          fi
+          echo "PR ${PR} state: ${STATE}"
+
           if [ "$STATE" != "OPEN" ]; then
             echo "PR ${PR} is ${STATE}, nothing to do"
             exit 0
           fi
 
+          echo "merge state: $(gh pr view "$PR" --repo "$GH_REPO" --json mergeStateStatus --jq '.mergeStateStatus' 2>/dev/null || echo unknown)"
+
           # --auto hands the merge to GitHub, which waits for the required
-          # status checks configured by .github/workflows/branch-protection.yml.
-          if gh pr merge "$PR" --squash --auto --delete-branch 2>/dev/null; then
+          # status checks. Those checks run against the PR merge ref, so the
+          # integration is validated even though the branch itself may lag main.
+          if OUT=$(gh pr merge "$PR" --repo "$GH_REPO" --squash --auto --delete-branch 2>&1); then
             echo "auto-merge enabled on PR ${PR}"
+            echo "$OUT"
           else
-            echo "::warning::--auto not accepted, falling back to --squash"
-            gh pr merge "$PR" --squash --delete-branch || true
+            echo "::error::gh pr merge --auto failed:"
+            echo "$OUT"
+            exit 1
           fi
 
   retrigger:
