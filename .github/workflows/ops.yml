@@ -146,6 +146,8 @@ jobs:
       phase: ${{ steps.meta.outputs.phase }}
       branch: ${{ steps.meta.outputs.branch }}
       done: ${{ steps.commit.outputs.done }}
+      env_blocked: ${{ steps.commit.outputs.env_blocked }}
+      pr: ${{ steps.pr.outputs.pr }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -221,6 +223,16 @@ jobs:
             echo "BOT_DONE=true" >> "$GITHUB_ENV"
           else
             echo "done=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Surfaced as a job output rather than read from git by the retrigger.
+          # The marker below is only ever committed to pf-bot/<phase>, so an API
+          # read against main would never see it.
+          if [ -f "workspace/${PHASE}/.env_blocked" ]; then
+            echo "env_blocked=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::environment not ready: $(cat workspace/${PHASE}/.env_blocked)"
+          else
+            echo "env_blocked=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Open or update PR
@@ -404,25 +416,26 @@ jobs:
 
   retrigger:
     name: chain next phase
-    needs: [select-phase]
+    needs: [select-phase, run-phase]
     if: always() && needs.select-phase.outputs.exists == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - env:
+      - name: Chain or stand down
+        env:
           GH_TOKEN: ${{ github.token }}
           PHASE: ${{ needs.select-phase.outputs.phase }}
+          ENV_BLOCKED: ${{ needs.run-phase.outputs.env_blocked }}
         run: |
           set -uo pipefail
 
           # If the environment was not ready (missing OPENCODE_API_KEY, opencode
           # not installed, network down) the phase made no progress and
-          # re-dispatching would tight-loop every 10 seconds. Leave it to the
-          # tick.yml cron, which retries on a sane cadence.
-          if gh api "repos/${GITHUB_REPOSITORY}/contents/workspace/${PHASE}/.env_blocked" >/dev/null 2>&1; then
+          # re-dispatching would chain a no-op run every ten seconds. The
+          # tick.yml cron retries instead, which is the right cadence for "the
+          # key was just added".
+          if [ "$ENV_BLOCKED" = "true" ]; then
             echo "environment was not ready, not re-dispatching. ops-tick will retry."
-            gh api "repos/${GITHUB_REPOSITORY}/contents/workspace/${PHASE}/.env_blocked" \
-              --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | sed 's/^/  reason: /' || true
             exit 0
           fi
 
