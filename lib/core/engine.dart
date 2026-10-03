@@ -190,12 +190,10 @@ class ResizeEngine {
     // Frames only survive when the user has not opted out and the chosen
     // container can actually hold them.
     final animated =
-        s.preserveAnimation &&
-        decoded.hasAnimation &&
-        outFormat.supportsFrames;
+        s.preserveAnimation && decoded.hasAnimation && outFormat.supportsFrames;
     final inputs = animated
-        ? List<img.Image>.of(oriented.frames)
-        : <img.Image>[oriented.frames.first];
+        ? oriented.frames.map(_detachFrame).toList()
+        : <img.Image>[_detachFrame(oriented.frames.first)];
 
     // Geometry comes from frame 0 once, so every frame lands on identical
     // dimensions instead of drifting with each frame's own aspect ratio.
@@ -324,6 +322,13 @@ class ResizeEngine {
     );
   }
 
+  /// Frame zero of a decoded animation *is* the animation: `frames` hangs the
+  /// whole sequence off it. Every transform in the pipeline walks `frames`, so a
+  /// frame has to be handed over detached or transforming frame 0 would quietly
+  /// re-process every other frame as well.
+  static img.Image _detachFrame(img.Image frame) =>
+      frame.numFrames == 1 ? frame : img.Image.from(frame, noAnimation: true);
+
   /// One frame through the whole pipeline.
   ///
   /// [geometry] is shared by every frame of a source so an animation cannot
@@ -372,10 +377,7 @@ class ResizeEngine {
 
   /// Rebuilds an animation from already-transformed frames, keeping the source
   /// loop count so the result still repeats the way the input did.
-  static img.Image _assemble(
-    List<img.Image> frames, {
-    required int loopCount,
-  }) {
+  static img.Image _assemble(List<img.Image> frames, {required int loopCount}) {
     final head = frames.first;
     for (var i = 1; i < frames.length; i++) {
       head.addFrame(frames[i]);

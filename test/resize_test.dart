@@ -18,19 +18,30 @@ Uint8List _makeJpeg(int w, int h, {int quality = 92}) {
   return img.encodeJpg(im, quality: quality);
 }
 
-/// A gradient with a frame-specific corner marker, so every frame is
-/// distinguishable from every other one after a round trip.
+/// A gradient whose blue channel is a per-frame constant, so every frame is
+/// still distinguishable from every other one after a resize and a lossy
+/// re-encode. Mean blue is the statistic that proves it.
 img.Image _frame(int index, int w, int h) {
   final im = img.Image(width: w, height: h, numChannels: 3);
   for (var y = 0; y < h; y++) {
     for (var x = 0; x < w; x++) {
-      im.setPixelRgba(x, y, (x * 255 ~/ w), (y * 255 ~/ h), 40 + index * 40, 255);
+      im.setPixelRgba(
+        x,
+        y,
+        (x * 255 ~/ w),
+        (y * 255 ~/ h),
+        frameBlue(index),
+        255,
+      );
     }
   }
-  im.setPixelRgba(0, 0, 255, 0, 0, 255);
-  im.setPixelRgb(1, 0, 0, 255 * index ~/ 8, 0);
   return im;
 }
+
+/// Blue tint for frame [index]. Wide enough spacing that 256-colour
+/// quantisation plus Floyd-Steinberg dithering cannot collapse two frames
+/// onto the same value.
+int frameBlue(int index) => 20 + index * 70;
 
 Uint8List _makeAnimatedGif(
   int w,
@@ -39,7 +50,7 @@ Uint8List _makeAnimatedGif(
   List<int>? durations,
 }) {
   final head = _frame(0, w, h);
-  head.frameDuration = (durations?[0] ?? 100);
+  head.frameDuration = durations?[0] ?? 100;
   for (var i = 1; i < frameCount; i++) {
     final f = head.addFrame(_frame(i, w, h));
     f.frameDuration = durations?[i] ?? 100;
@@ -457,29 +468,36 @@ void main() {
       );
 
       final decoded = img.decodeGif(res.bytes)!;
-      // GIF stores hundredths of a second, so 40ms is not representable.
-      expect(
-        decoded.frames.map((f) => f.frameDuration).toList(),
-        [0, 80, 120, 200],
-      );
+      expect(decoded.frames.map((f) => f.frameDuration).toList(), durations);
     });
 
     test('each frame keeps its own pixels', () async {
+      // Lossless WebP so the check reads the pipeline rather than GIF's
+      // 256-colour quantiser, which is free to shift a channel by a few steps.
       final res = await ResizeEngine.run(
         _makeAnimatedGif(80, 60, 4),
-        _gifSettings(width: 40),
+        ResizeSettings()
+          ..setMode(ResizeMode.width)
+          ..setWidth(40)
+          ..setFormat(OutputFormat.webp)
+          ..setWebpLossless(true),
         name: 'spin.gif',
       );
 
-      final decoded = img.decodeGif(res.bytes)!;
-      final markers = <int>{};
-      for (final f in decoded.frames) {
-        final marker = f.getPixel(0, 0);
-        // The fixture paints pure red into (0,0) on every frame, so read the
-        // green channel, which the fixture varies per frame.
-        markers.add((f.getPixel(1, 0).g * 8 ~/ 255) + 1);
+      final decoded = img.decodeWebP(res.bytes)!;
+      expect(decoded.numFrames, 4);
+      for (var i = 0; i < decoded.numFrames; i++) {
+        final f = decoded.frames[i];
+        var sum = 0.0;
+        for (final p in f) {
+          sum += p.b;
+        }
+        expect(
+          sum / (f.width * f.height),
+          closeTo(frameBlue(i), 1),
+          reason: 'frame $i is not the frame it should be',
+        );
       }
-      expect(markers.length, 4, reason: 'frames are copies of one another');
     });
 
     test('preserveAnimation false flattens to frame one', () async {
@@ -572,19 +590,68 @@ void main() {
       }
     });
 
-    test('animated TIFF is reported rather than silently pageless', () async {
+    test('every frame is padded onto the same canvas', () async {
+      final s = ResizeSettings()
+        ..setMode(ResizeMode.exactFit)
+        ..setWidth(50)
+        ..setHeight(50)
+        ..setFormat(OutputFormat.gif);
+
       final res = await ResizeEngine.run(
-        _makeAnimatedGif(80, 60, 3),
-        ResizeSettings()
-          ..setMode(ResizeMode.width)
-          ..setWidth(40)
-          ..setFormat(OutputFormat.tiff),
+        _makeAnimatedGif(80, 60, 4),
+        s,
         name: 'spin.gif',
       );
 
-      expect(res.frames, 1);
-      expect(res.notice, contains('TIFF'));
+      expect(res.width, 50);
+      expect(res.height, 50);
+      final decoded = img.decodeGif(res.bytes)!;
+      expect(decoded.numFrames, 4);
+      for (var i = 0; i < decoded.numFrames; i++) {
+        expect(decoded.frames[i].width, 50, reason: 'frame $i width');
+        expect(decoded.frames[i].height, 50, reason: 'frame $i height');
+      }
     });
+
+    test('the crop plan is computed once and used by every frame', () async {
+      final s = ResizeSettings()
+        ..setMode(ResizeMode.exactCrop)
+        ..setWidth(40)
+        ..setHeight(40)
+        ..setFormat(OutputFormat.webp);
+
+      final res = await ResizeEngine.run(
+        _makeAnimatedWebP(80, 60, 4),
+        s,
+        name: 'spin.webp',
+      );
+
+      expect(res.width, 40);
+      expect(res.height, 40);
+      final decoded = img.decodeWebP(res.bytes)!;
+      expect(decoded.numFrames, 4);
+      for (var i = 0; i < decoded.numFrames; i++) {
+        expect(decoded.frames[i].width, 40, reason: 'frame $i width');
+        expect(decoded.frames[i].height, 40, reason: 'frame $i height');
+      }
+    });
+
+    test(
+      'an animated TIFF is reported rather than silently pageless',
+      () async {
+        final res = await ResizeEngine.run(
+          _makeAnimatedGif(80, 60, 3),
+          ResizeSettings()
+            ..setMode(ResizeMode.width)
+            ..setWidth(40)
+            ..setFormat(OutputFormat.tiff),
+          name: 'spin.gif',
+        );
+
+        expect(res.frames, 1);
+        expect(res.notice, contains('TIFF'));
+      },
+    );
   });
 
   group('settings persistence', () {

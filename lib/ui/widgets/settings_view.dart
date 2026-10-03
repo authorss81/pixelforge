@@ -244,10 +244,7 @@ class SettingsView extends StatelessWidget {
       dense: true,
       value: s.preserveAnimation,
       onChanged: s.setPreserveAnimation,
-      title: const Text(
-        'Preserve animation',
-        style: TextStyle(fontSize: 13.5),
-      ),
+      title: const Text('Preserve animation', style: TextStyle(fontSize: 13.5)),
       subtitle: Text(
         'Every frame of an animated GIF or WebP is carried through. '
         'Turning it off flattens to the first frame.',
